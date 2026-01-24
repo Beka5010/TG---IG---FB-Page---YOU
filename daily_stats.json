@@ -1,0 +1,15 @@
+{
+  "date": "2026-01-24",
+  "morning": 0,
+  "afternoon": 0,
+  "video": 0,
+  "photo": 0,
+  "text": 0,
+  "total": 0,
+  "tokens": {
+    "prompt_tokens": 0,
+    "completion_tokens": 0,
+    "total_tokens": 0
+  },
+  "cost_usd": 0.0
+}

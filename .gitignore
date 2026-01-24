@@ -1,0 +1,15 @@
+.env
+.env.local
+
+.venv/
+__pycache__/
+*.pyc
+
+tmp_media/
+ready/
+downloads/
+
+*.mp4
+*.wav
+*.mp3
+
