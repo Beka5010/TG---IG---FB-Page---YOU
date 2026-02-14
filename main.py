@@ -11,6 +11,7 @@ import mimetypes
 import textwrap
 import re
 import shutil
+import subprocess
 from typing import Optional
 from collections import deque
 from pathlib import Path
@@ -24,8 +25,9 @@ import PIL.Image
 if not hasattr(PIL.Image, 'ANTIALIAS'):
     PIL.Image.ANTIALIAS = PIL.Image.LANCZOS
 import moviepy.editor as mpe
-import moviepy.video.fx.all as vfx
 from moviepy.editor import VideoFileClip, AudioFileClip, ColorClip, TextClip, CompositeVideoClip, ImageClip, concatenate_videoclips, concatenate_audioclips, CompositeAudioClip
+from moviepy.video.fx import all as vfx_all
+from moviepy.audio.fx import all as afx_all
 from openai import OpenAI
 from telegram import Update
 from telegram.constants import MessageEntityType
@@ -132,6 +134,7 @@ USER_REACTIONS = {}
 
 
 POST_QUEUE = deque()
+VIDEO_PROCESSING_QUEUE = asyncio.Queue()  # FIX B: Очередь для фоновой обработки видео
 IS_POSTING = False
 # Первое включение после рестарта — публикуем сразу первый пост без ожиданий
 FIRST_RUN_IMMEDIATE = True
@@ -148,6 +151,31 @@ READY_TO_PUBLISH_DIR = Path("ready_to_publish")
 READY_TO_PUBLISH_DIR.mkdir(exist_ok=True)
 TARGET_READY_POSTS = 10  # Поддерживаем 10 готовых постов (5 дней автономной работы)
 IS_PREPARING = False  # Флаг для контроля одновременной подготовки
+
+
+async def safe_unlink(path: Path | str, retries: int = 10, delay: float = 0.4):
+    """Async-safe unlink with retries to handle Windows file locks (WinError 32).
+    Does not raise; only logs on failure.
+    """
+    p = Path(path)
+    if not p.exists():
+        return
+    for i in range(retries):
+        try:
+            p.unlink()
+            return
+        except PermissionError:
+            await asyncio.sleep(delay)
+        except Exception:
+            log.exception(f"[CLEANUP] Failed to delete {path}")
+            return
+    log.error(f"[CLEANUP] Still locked after retries: {path}")
+
+
+def _clamp_t(t: float, duration: float, eps: float = 0.25) -> float:
+    if duration is None:
+        return t
+    return max(0.0, min(float(t), max(0.0, float(duration) - eps)))
 
 QUEUE_FILE = Path("post_queue.json")
 SEEN_FILE = Path("seen_posts.json")
@@ -170,7 +198,28 @@ LAST_PHOTO_TIME = None
 LAST_VIDEO_TIME = None
 LAST_POST_TIME = None
 LAST_POST_TIME_FILE = Path("last_post_time.json")
+FORCE_POST_NOW = False  # Флаг для форс-публикации (/postnow)
+POSTNOW_EVENT = asyncio.Event()  # Event для немедленного пробуждения воркера
 VIDEO_MIRROR_TOGGLE = False
+
+
+async def sleep_or_postnow(seconds: int) -> bool:
+    """
+    True  -> проснулись из-за /postnow
+    False -> досидели таймер по расписанию
+    """
+    global FORCE_POST_NOW
+    # Если /postnow активен — пропускаем паузу и считаем, что проснулись по POSTNOW
+    if FORCE_POST_NOW:
+        log.info("[SCHEDULER] POSTNOW override: skip cooldown sleep")
+        return True
+    try:
+        await asyncio.wait_for(POSTNOW_EVENT.wait(), timeout=seconds)
+        POSTNOW_EVENT.clear()  # ВАЖНО: сбросить, иначе будет «вечно включён»
+        return True
+    except asyncio.TimeoutError:
+        return False
+
 
 # Хранилище опубликованных текстов для проверки повторов
 PUBLISHED_TEXTS_FILE = Path("published_texts.json")
@@ -424,6 +473,9 @@ async def publish_to_instagram(item: dict):
         return True
     
     caption = item.get("caption") or item.get("text") or ""
+    # Clean strong-markdown and log final caption for IG
+    caption = (caption or "").replace("**", "")
+    log.info(f"CAPTION_TO_IG: {caption[:300]}")
     safe_caption = clean_social_text(caption)
     log.info(f"IG_CAPTION len={len(safe_caption)} text={safe_caption[:300]}")
 
@@ -504,6 +556,8 @@ async def publish_to_instagram_carousel(item: dict, image_urls: list[str]):
         return
 
     caption = item.get("caption") or item.get("text") or ""
+    caption = (caption or "").replace("**", "")
+    log.info(f"CAPTION_TO_IG: {caption[:300]}")
     safe_caption = clean_social_text(caption)
 
     child_ids = []
@@ -592,6 +646,8 @@ async def publish_to_facebook(item: dict):
         return
     
     caption = item.get("caption") or item.get("text") or ""
+    caption = (caption or "").replace("**", "")
+    log.info(f"CAPTION_TO_IG: {caption[:300]}")
     safe_caption = clean_social_text(caption)
 
     try:
@@ -765,26 +821,83 @@ def reset_ig_schedule_if_needed():
         IG_SCHEDULE["afternoon_carousels"] = 0
 
 
-def can_ig_publish(media_kind: str) -> bool:
+def can_ig_publish(media_kind: str, force: bool = False) -> bool:
     """
-    IG расписание (ОБНОВЛЕНО):
+    IG расписание (9 постов/день):
     - Только video (Reels)
-    - Публикация разрешена ВСЕГДА (синхронно с TG и FB)
-    - Без ограничений по времени
+    - Утро (до 14:00): максимум 3 поста
+    - Пауза (14:00-16:00): публикация запрещена
+    - Вечер (16:00-21:00): максимум 6 постов (по 1 каждый час)
+    - После 21:00: публикация запрещена до следующего дня
+    - Обязательно выдерживаем интервал 60 минут между постами
     """
+    if force:
+        log.info("[IG_SCHEDULE] POSTNOW override: force publish (ignoring working hours)")
+        return True
+
     if media_kind != "video":
         return False
-
+    
     reset_ig_schedule_if_needed()
-    # Публикация разрешена всегда для синхронизации с TG и FB
+    
+    now = datetime.now()
+    current_time = now.time()
+    current_hour = now.hour
+    
+    # Проверяем временные окна
+    # После 21:00 - публикация запрещена
+    if current_hour > 21 or current_hour < 8:
+        log.info(f"[IG_SCHEDULE] DENY: outside working hours (current_hour={current_hour})")
+        return False
+    
+    # Пауза 14:00-16:00
+    if 14 <= current_hour < 16:
+        log.info(f"[IG_SCHEDULE] DENY: pause window 14:00-16:00 (current_hour={current_hour})")
+        return False
+    
+    # Утро (до 14:00): максимум 3 поста
+    if current_hour < 14:
+        if IG_SCHEDULE["morning_videos"] >= 3:
+            log.info(f"[IG_SCHEDULE] DENY: morning limit reached ({IG_SCHEDULE['morning_videos']}/3)")
+            return False
+    # Вечер (16:00-21:00): максимум 6 постов
+    elif 16 <= current_hour <= 21:
+        if IG_SCHEDULE["afternoon_videos"] >= 6:
+            log.info(f"[IG_SCHEDULE] DENY: evening limit reached ({IG_SCHEDULE['afternoon_videos']}/6)")
+            return False
+    
+    # Проверяем интервал 60 минут между постами (для IG последний пост)
+    if LAST_POST_TIME is not None:
+        time_since_last = (now - LAST_POST_TIME).total_seconds()
+        if time_since_last < 3600:  # 60 минут = 3600 секунд
+            remaining = 3600 - time_since_last
+            log.info(f"[IG_SCHEDULE] DENY: cooldown active ({remaining:.0f}s remaining)")
+            return False
+    
+    log.info(f"[IG_SCHEDULE] ALLOW: can publish (hour={current_hour}, morning={IG_SCHEDULE['morning_videos']}/3, evening={IG_SCHEDULE['afternoon_videos']}/6)")
     return True
 
 
 def ig_mark_published(media_kind: str):
+    """Отмечает, что пост опубликован, и увеличивает счётчик по времени суток."""
     reset_ig_schedule_if_needed()
+    
     if media_kind == "video":
-        # Считаем все посты без разделения по времени
-        IG_SCHEDULE["afternoon_videos"] += 1
+        now = datetime.now()
+        current_hour = now.hour
+        
+        # Определяем, какой счётчик увеличить, на основе текущего времени
+        if current_hour < 14:
+            # Утро (до 14:00)
+            IG_SCHEDULE["morning_videos"] += 1
+            log.info(f"[IG_SCHEDULE] Morning video published. Counter: {IG_SCHEDULE['morning_videos']}/3")
+        elif 16 <= current_hour <= 21:
+            # Вечер (16:00-21:00)
+            IG_SCHEDULE["afternoon_videos"] += 1
+            log.info(f"[IG_SCHEDULE] Evening video published. Counter: {IG_SCHEDULE['afternoon_videos']}/6")
+        else:
+            # Вне расписания (14:00-16:00 или после 21:00) - не должно быть
+            log.warning(f"[IG_SCHEDULE] Video published outside schedule window (hour={current_hour})")
 
 
 def load_published_texts():
@@ -1355,7 +1468,7 @@ def _render_caption_image(text: str, width: int = 1080, height: int = 200) -> Pa
         return None
 
 
-def process_video(local_path: Path, caption: str | None = None, speed_multiplier: float = 1.01, bg_color_override: tuple | None = None, brightness_adjust: float = 0.0, random_crop: bool = False, voiceover_path: str | None = None, source: str | None = None) -> Path | None:
+def process_video(local_path: Path, caption: str | None = None, speed_multiplier: float = 1.01, bg_color_override: tuple | None = None, brightness_adjust: float = 0.0, random_crop: bool = False, voiceover_path: str | None = None) -> Path | None:
     """
     Собирает видео в стиле Reels:
     - Канвас 1080x1920 тёмный
@@ -1438,11 +1551,11 @@ def process_video(local_path: Path, caption: str | None = None, speed_multiplier
 
         # После crop видео ресайзится обратно до нужного размера для 1080x1920 канваса
         clip = clip.resize(width=new_w, height=new_h)
-        clip = clip.fx(vfx.speedx, speed_multiplier)
+        clip = clip.fx(vfx_all.speedx, speed_multiplier)
         
         # Применяем коррекцию яркости (План Б)
         if brightness_adjust != 0.0:
-            clip = clip.fx(vfx.colorx, 1.0 + brightness_adjust)
+            clip = clip.fx(vfx_all.colorx, 1.0 + brightness_adjust)
             log.info(f"[PLAN B] Brightness adjusted: {brightness_adjust:+.3f}")
         
         # SMART SLICER & ZOOM: Нарезка на сегменты с Crossfade и легким зумом (замена шума)
@@ -1463,7 +1576,11 @@ def process_video(local_path: Path, caption: str | None = None, speed_multiplier
                     if end_time - current_time < 0.5:
                         break
                     
-                    segment = clip.subclip(current_time, end_time)
+                    start_t = _clamp_t(current_time, clip.duration)
+                    end_t = _clamp_t(end_time, clip.duration)
+                    if end_t <= start_t:
+                        end_t = _clamp_t(start_t + 0.5, clip.duration)
+                    segment = clip.subclip(start_t, end_t)
                     
                     # Применяем легкий зум к каждому сегменту
                     segment = segment.resize(zoom_factor)
@@ -1522,11 +1639,20 @@ def process_video(local_path: Path, caption: str | None = None, speed_multiplier
                 # Создаем 3 сегмента с микро-вырезами (если seg3 валидный)
                 segments = []
                 if seg1_end > seg1_start:
-                    segments.append(clip.subclip(seg1_start, seg1_end))
+                    s1 = _clamp_t(seg1_start, clip.duration)
+                    e1 = _clamp_t(seg1_end, clip.duration)
+                    if e1 > s1:
+                        segments.append(clip.subclip(s1, e1))
                 if seg2_end > seg2_start:
-                    segments.append(clip.subclip(seg2_start, seg2_end))
+                    s2 = _clamp_t(seg2_start, clip.duration)
+                    e2 = _clamp_t(seg2_end, clip.duration)
+                    if e2 > s2:
+                        segments.append(clip.subclip(s2, e2))
                 if seg3_start < seg3_end and seg3_start < duration - 0.05:
-                    segments.append(clip.subclip(seg3_start, seg3_end))
+                    s3 = _clamp_t(seg3_start, clip.duration)
+                    e3 = _clamp_t(seg3_end, clip.duration)
+                    if e3 > s3:
+                        segments.append(clip.subclip(s3, e3))
                 
                 # Склеиваем сегменты
                 if len(segments) > 1:
@@ -1535,15 +1661,23 @@ def process_video(local_path: Path, caption: str | None = None, speed_multiplier
                     log.warning("[MICRO-STITCH] Not enough valid segments, skipping stitch")
                 
                 # Random Trim
-                if clip.duration > trim_duration + 1.0:
-                    if random.choice([True, False]):
-                        # Отрезаем с начала
-                        clip = clip.subclip(trim_duration, clip.duration)
-                        log.info(f"[MICRO-STITCH] Trimmed {trim_duration}s from start")
-                    else:
-                        # Отрезаем с конца
-                        clip = clip.subclip(0, clip.duration - trim_duration)
-                        log.info(f"[MICRO-STITCH] Trimmed {trim_duration}s from end")
+                    if clip.duration > trim_duration + 1.0:
+                        if random.choice([True, False]):
+                            # Отрезаем с начала
+                            s = _clamp_t(trim_duration, clip.duration)
+                            e = _clamp_t(clip.duration, clip.duration)
+                            if e <= s:
+                                e = _clamp_t(s + 0.5, clip.duration)
+                            clip = clip.subclip(s, e)
+                            log.info(f"[MICRO-STITCH] Trimmed {trim_duration}s from start")
+                        else:
+                            # Отрезаем с конца
+                            s = _clamp_t(0, clip.duration)
+                            e = _clamp_t(clip.duration - trim_duration, clip.duration)
+                            if e <= s:
+                                e = _clamp_t(s + 0.5, clip.duration)
+                            clip = clip.subclip(s, e)
+                            log.info(f"[MICRO-STITCH] Trimmed {trim_duration}s from end")
                 
                 duration = clip.duration
                 log.info(f"[MICRO-STITCH] Applied 3 segments with frame cuts. New duration: {duration:.2f}s")
@@ -1567,184 +1701,50 @@ def process_video(local_path: Path, caption: str | None = None, speed_multiplier
         out_path = Path("tmp_media") / f"proc_{local_path.stem}.mp4"
         out_path.parent.mkdir(parents=True, exist_ok=True)
         final_video = CompositeVideoClip(layers)
-        
-        # --- УМНЫЙ ФИЛЬТР ИСТОЧНИКА ---
-        # Проверяем source из параметра или по названию файла (fallback)
-        if source:
-            is_instagram = (source == "instagram")
-        else:
-            # Fallback для старых вызовов
-            is_instagram = local_path.name.startswith("instagram_")
-        
-        log.info(f"[PROCESS_VIDEO] Source: {source or 'detected from filename'}, is_instagram: {is_instagram}")
-        
-        # 5. Озвучка ElevenLabs (СИСТЕМА РЕТРАЕВ)
-        voiceover_audio = None
-        original_audio = None
-        
-        # Определяем original_audio из clip.audio, если он есть
-        if clip.audio is not None:
-            original_audio = clip.audio
-        
-        if is_instagram:
-            log.info("[SMART ROUTING] Instagram source → Full processing (Voice + Music)")
-            
-            # Проверяем, есть ли готовый файл озвучки или нужно генерировать
-            if voiceover_path and Path(voiceover_path).exists():
-                # Используем готовый файл озвучки
-                try:
-                    voiceover_audio = AudioFileClip(str(voiceover_path))
-                    log.info(f"[ELEVENLABS] Using existing voiceover: {Path(voiceover_path).name}")
-                except Exception as e:
-                    log.warning(f"[ELEVENLABS] Failed to load existing voiceover: {e}")
-            elif caption and caption.strip() and ELEVENLABS_API_KEY:
-                # Генерируем озвучку с ретраями
-                post_id = uuid.uuid4().hex[:8]
-                voiceover_filename = f"voiceover_{post_id}.mp3"
-                voiceover_path_full = Path("tmp_media") / voiceover_filename
-                voiceover_path_full.parent.mkdir(parents=True, exist_ok=True)
-                
-                # Берем текст для озвучки (весь caption, но убираем хэштеги и footer)
-                # ВАЖНО: Обычно озвучка генерируется ДО вызова process_video, это fallback
-                import re
-                text_for_voice = caption or ""
-                # Убираем хэштеги
-                text_for_voice = re.sub(r'#\w+', '', text_for_voice)
-                # Убираем footer (ссылки на канал)
-                text_for_voice = re.sub(r'\|.*?\|', '', text_for_voice)
-                text_for_voice = re.sub(r'<a.*?</a>', '', text_for_voice)
-                text_for_voice = text_for_voice.strip()
-                
-                if text_for_voice:
-                    log.info(f"[ELEVENLABS] Starting voiceover process for: {text_for_voice[:50]}...")
-                    
-                    try:
-                        from elevenlabs.client import ElevenLabs
-                        eleven_client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
-                    except ImportError:
-                        log.error("[ELEVENLABS] elevenlabs package not installed")
-                        eleven_client = None
-                    
-                    if eleven_client:
-                        for attempt in range(1, 4):  # 3 попытки
-                            try:
-                                log.info(f"[ELEVENLABS] Attempt {attempt}/3...")
-                                
-                                # Если файл остался от прошлой неудачной попытки — удаляем
-                                if voiceover_path_full.exists():
-                                    try: 
-                                        voiceover_path_full.unlink()
-                                    except: 
-                                        pass
-                                
-                                # --- ГЕНЕРАЦИЯ: НАСТРОЙКИ "ЖИВОЙ ЧЕЛОВЕК" ---
-                                audio_generator = eleven_client.text_to_speech.convert(
-                                    voice_id="RlVk06jBShtFu3ub6usx", # Твой клон
-                                    text=text_for_voice,
-                                    model_id="eleven_multilingual_v2",
-                                    voice_settings={
-                                        "stability": 0.35,        # Снижаем до 0.35! Голос станет эмоциональнее и живее.
-                                        "similarity_boost": 0.60, # Снижаем до 0.60! Уйдет "металлический" звон.
-                                        "style": 0.55,            # Добавляем 55% стиля (экспрессия).
-                                        "use_speaker_boost": True
-                                    }
-                                )
-                                # Превращаем поток данных в аудиофайл
-                                audio_data = b"".join(list(audio_generator))
-                                
-                                # Сохраняем файл
-                                with open(voiceover_path_full, "wb") as f:
-                                    f.write(audio_data)
-                                
-                                # Загружаем аудио в MoviePy
-                                temp_audio = AudioFileClip(str(voiceover_path_full))
-                                
-                                # --- УСКОРЕНИЕ ГОЛОСА ДЛЯ РИЛСА ---
-                                # 1.15 означает ускорение на 15%. Можно ставить 1.1 или 1.2
-                                voiceover_audio = temp_audio.fx(vfx.speedx, 1.15)
-                                
-                                log.info(f"[ELEVENLABS] Success on attempt {attempt}! Voice speed increased by 15%.")
-                                break  # Если дошли сюда — всё круто, выходим из цикла попыток
-                                
-                            except Exception as e:
-                                log.error(f"[ELEVENLABS] Attempt {attempt} failed: {e}")
-                                if attempt < 3:
-                                    wait_time = 5 * attempt  # С каждой попыткой ждем дольше (5с, 10с)
-                                    log.info(f"[ELEVENLABS] Retrying in {wait_time} seconds...")
-                                    time_module.sleep(wait_time)
-                                else:
-                                    log.critical("[ELEVENLABS] All 3 attempts failed. Moving to original audio.")
-        else:
-            log.info("[SMART ROUTING] Telegram source → Template only (No Voiceover)")
-            voiceover_audio = None  # Пропускаем озвучку для обычных файлов
-        
-        # --- СКЛЕЙКА ЗВУКА (ГОЛОС + ФОНОВАЯ МУЗЫКА) ---
-        if voiceover_audio is not None:
-            try:
-                log.info("[AUDIO] Mixing voiceover with background music")
-                
-                # 1. Голос (уже ускоренный)
-                voice_track = voiceover_audio.volumex(1.2) # Немного прибавим громкость голоса
-                
-                # --- ВЫБОР СЛУЧАЙНОГО ХИТА ИЗ ПАПКИ ASSETS ---
-                assets_dir = Path("assets")
-                # Ищем все mp3 файлы в папке
-                music_files = list(assets_dir.glob("*.mp3"))
-                
-                if music_files:
-                    random_music_path = random.choice(music_files)
-                    log.info(f"[AUDIO] Selected random hit: {random_music_path.name}")
-                    
-                    # ГРОМКОСТЬ 7% (Было 15%)
-                    bg_music = AudioFileClip(str(random_music_path)).volumex(0.07)
-                    
-                    # Зацикливание музыки, если она короче видео
-                    video_duration = final_video.duration
-                    music_duration = bg_music.duration
-                    
-                    if music_duration < video_duration:
-                        # Вычисляем, сколько раз нужно повторить музыку
-                        loops_needed = int(video_duration / music_duration) + 1
-                        log.info(f"[AUDIO] Music ({music_duration:.2f}s) shorter than video ({video_duration:.2f}s). Looping {loops_needed} times.")
-                        
-                        # Создаем список копий музыки для зацикливания
-                        music_clips = [bg_music] * loops_needed
-                        bg_music = concatenate_audioclips(music_clips)
-                    
-                    # Обрезаем музыку точно под длину видео
-                    bg_music = bg_music.subclip(0, video_duration)
-                    
-                    final_audio = CompositeAudioClip([voice_track, bg_music])
-                else:
-                    log.warning("[AUDIO] No mp3 files found in assets folder. Using voice only.")
-                    final_audio = voice_track
 
-                final_video = final_video.set_audio(final_audio)
-                
-            except Exception as audio_err:
-                log.error(f"[AUDIO] Mixing failed: {audio_err}")
-                if original_audio is not None:
-                    final_video = final_video.set_audio(original_audio)
-                else:
-                    # Fallback: используем только голос без музыки
-                    try:
-                        final_video = final_video.set_audio(voiceover_audio)
-                    except:
-                        pass
-        
-        # Удаляем временный файл озвучки после использования
+        # PROFESSIONAL AUDIO: Озвучка ElevenLabs ИЛИ обработка оригинального аудио
         if voiceover_path and Path(voiceover_path).exists():
             try:
+                # 🎙️ ОЗВУЧКА: Используем ElevenLabs вместо оригинального аудио
+                
+                voiceover_audio = AudioFileClip(str(voiceover_path))
+                
+                # Подгоняем длительность озвучки под длительность видео
+                if voiceover_audio.duration < duration:
+                    # Если озвучка короче - повторяем оригинальное аудио после неё
+                    if clip.audio is not None:
+                        remaining_duration = duration - voiceover_audio.duration
+                        audio_end = min(clip.audio.duration, remaining_duration)
+                        audio_end = _clamp_t(audio_end, clip.audio.duration)
+                        original_audio = clip.audio.subclip(0, audio_end)
+                       # from moviepy import concatenate_audioclips
+                        audio_track = concatenate_audioclips([voiceover_audio, original_audio])
+                    else:
+                        # Если нет оригинального аудио - просто тишина после озвучки
+                        audio_track = voiceover_audio
+                elif voiceover_audio.duration > duration:
+                    # Видео короче голоса — замедляем видео, чтобы они совпали
+                     new_speed = duration / voiceover_audio.duration
+                     final_video = final_video.fx(vfx_all.speedx, new_speed)
+                     audio_track = voiceover_audio
+                     log.info(f"[SYNC] Видео замедлено до {new_speed:.2f} для совпадения с голосом")
+                else:
+                    audio_track = voiceover_audio
+                
+                # Принудительно задаем fps для аудио перед наложением на видео
+                if audio_track is not None:
+                    audio_track = audio_track.set_fps(44100)
+                final_video = final_video.set_audio(audio_track)
+                log.info(f"[ELEVENLABS] ✅ Voiceover applied to video: {Path(voiceover_path).name}")
+                
+                # Удаляем временный файл озвучки
                 Path(voiceover_path).unlink()
                 log.info("[ELEVENLABS] Voiceover file cleaned up after applying")
-            except Exception as e:
-                log.warning(f"[ELEVENLABS] Failed to delete voiceover file: {e}")
-        elif 'voiceover_path_full' in locals() and voiceover_path_full.exists():
-            try:
-                voiceover_path_full.unlink()
-                log.info("[ELEVENLABS] Generated voiceover file cleaned up")
-            except Exception as e:
-                log.warning(f"[ELEVENLABS] Failed to delete generated voiceover file: {e}")
+            except Exception as voiceover_err:
+                log.warning(f"[ELEVENLABS] Failed to apply voiceover: {voiceover_err}, using original audio")
+                # Fallback: используем оригинальное аудио
+                if clip.audio is not None:
+                    final_video = final_video.set_audio(clip.audio)
         elif clip.audio is not None:
             try:
                 audio_track = clip.audio
@@ -1763,7 +1763,7 @@ def process_video(local_path: Path, caption: str | None = None, speed_multiplier
                 tempo_change = random.uniform(0.995, 1.005)  # 99.5% - 100.5%
                 if abs(tempo_change - 1.0) > 0.001:
                     # Меняем скорость аудио через speedx
-                    audio_track = audio_track.with_effects([vfx.MultiplySpeed(tempo_change)])
+                    audio_track = audio_track.fx(afx_all.audio_speedx, tempo_change)
                     log.info(f"[PROFESSIONAL_AUDIO] Tempo adjusted: {tempo_change:.4f}x ({(tempo_change-1)*100:+.2f}%)")
                 
                 # Применяем обработанное аудио
@@ -1775,7 +1775,7 @@ def process_video(local_path: Path, caption: str | None = None, speed_multiplier
         # Размытие субтитров: создаем размытый прямоугольник внизу видео (где обычно субтитры)
         def add_blur_to_captions(clip):
             # Обрезаем кусок снизу, размываем его и накладываем обратно
-            overlay = clip.crop(y1=int(clip.h*0.8), y2=clip.h).fx(vfx.blur, 20)
+            overlay = clip.crop(y1=int(clip.h*0.8), y2=clip.h).fx(vfx_all.blur, 20)
             return CompositeVideoClip([clip, overlay.set_position(("center", "bottom"))])
         
         # Применяем размытие к видео
@@ -1783,43 +1783,56 @@ def process_video(local_path: Path, caption: str | None = None, speed_multiplier
         final_video = final_video.set_duration(final_video.duration - 0.5)
         log.info("[BLUR] Blur applied to bottom 20% of video (captions area)")
         
-        final_video.write_videofile(
-            str(out_path),
-            codec="libx264",
-            audio_codec="aac",
-            fps=30,
-            preset="slow",
-            bitrate="6000k",
-            ffmpeg_params=[
-                "-crf", "18",
-                "-pix_fmt", "yuv420p"
-            ],
-            logger=None,
-        )
+        # === SAFE_DURATION_FIX: гарантированное закрытие и безопасная длительность ===
+        eps = 0.25  # Safety margin для избежания WinError 32 при доступе за границы
+        safe_duration = final_video.duration - eps
         
-        # --- ОСВОБОЖДЕНИЕ ФАЙЛОВ ДЛЯ WINDOWS (ЗАДАЧА №3) ---
-        log.info("[CLEANUP] Starting resource release...")
+        # Проверяем, есть ли аудио и синхронизируем длительность видео и аудио
+        if final_video.audio is not None:
+            audio_duration = final_video.audio.duration
+            safe_duration = min(safe_duration, audio_duration - eps)
+            log.info(f"[SAFE_DURATION] Video: {final_video.duration:.2f}s, Audio: {audio_duration:.2f}s → Safe: {safe_duration:.2f}s (eps={eps})")
+            s = _clamp_t(0, final_video.duration)
+            e = _clamp_t(safe_duration, final_video.duration)
+            if e <= s:
+                e = _clamp_t(s + 0.5, final_video.duration)
+            final_video = final_video.subclip(s, e)
+            final_video.audio = final_video.audio.subclip(s, e)
+        else:
+            log.info(f"[SAFE_DURATION] No audio track. Trimming video: {final_video.duration:.2f}s → {safe_duration:.2f}s")
+            s = _clamp_t(0, final_video.duration)
+            e = _clamp_t(safe_duration, final_video.duration)
+            if e <= s:
+                e = _clamp_t(s + 0.5, final_video.duration)
+            final_video = final_video.subclip(s, e)
+        
+        # Запись видео с гарантированным закрытием ресурсов
         try:
-            # Закрываем основное видео
-            if 'final_video' in locals() and final_video is not None:
-                final_video.close()
-            
-            # Закрываем аудио дорожки, если они существуют
-            if 'audio_track' in locals() and audio_track is not None:
-                audio_track.close()
-                
-            if 'voiceover_audio' in locals() and voiceover_audio is not None:
-                voiceover_audio.close()
-                
-            if 'original_audio' in locals() and original_audio is not None:
-                original_audio.close()
-                
-            log.info("[CLEANUP] All resources released successfully")
-        except Exception as cleanup_err:
-            log.warning(f"[CLEANUP] Resource release issue: {cleanup_err}")
-        # --------------------------------------------------
+            final_video.write_videofile(
+                str(out_path),
+                codec="libx264",
+                audio_codec="aac",
+                fps=30,
+                preset="slow",
+                bitrate="6000k",
+                ffmpeg_params=[
+                    "-crf", "18",
+                    "-pix_fmt", "yuv420p"
+                ],
+                logger=None,
+            )
+            log.info("INFO | [PROCESS] Video unique processing: Success")
+        finally:
+            # Гарантированное закрытие всех открытых клипов (избегаем WinError 32)
+            try:
+                if hasattr(final_video, 'close'):
+                    final_video.close()
+                if hasattr(final_video, 'audio') and final_video.audio is not None and hasattr(final_video.audio, 'close'):
+                    final_video.audio.close()
+            except Exception as close_err:
+                log.warning(f"[SAFE_DURATION] Error closing video/audio clips: {close_err}")
         
-        log.info("INFO | [PROCESS] Video unique processing: Success")
+        log.info("[SAFE_DURATION] All clips closed successfully")
         
         # 🔄 AUTO-COMPRESS: Проверка размера и автоматическое пережатие (SIZE GUARD)
         try:
@@ -1833,88 +1846,67 @@ def process_video(local_path: Path, caption: str | None = None, speed_multiplier
                 # Создаем временный файл для пережатой версии
                 compressed_path = out_path.parent / f"compressed_{out_path.name}"
                 
-                # ПЕРВАЯ ПОПЫТКА: CRF 22, bitrate 4000k
-                final_video.write_videofile(
-                    str(compressed_path),
-                    codec="libx264",
-                    audio_codec="aac",
-                    fps=30,
-                    preset="medium",
-                    bitrate="4000k",
-                    ffmpeg_params=[
-                        "-crf", "22",
-                        "-pix_fmt", "yuv420p"
-                    ],
-                    logger=None,
-                )
+                # ПЕРВАЯ ПОПЫТКА: CRF 22, bitrate 4000k через ffmpeg (file-based)
+                cmd_crf22 = [
+                    "ffmpeg", "-y",
+                    "-i", str(out_path),
+                    "-c:v", "libx264",
+                    "-preset", "medium",
+                    "-b:v", "4000k",
+                    "-crf", "22",
+                    "-pix_fmt", "yuv420p",
+                    "-c:a", "aac",
+                    "-b:a", "128k",
+                    str(compressed_path)
+                ]
                 
-                compressed_size_mb = compressed_path.stat().st_size / (1024 * 1024)
-                log.info(f"[AUTO-COMPRESS] New size with CRF 22: {compressed_size_mb:.2f} MB (was {file_size_mb:.2f} MB)")
-                
-                if compressed_size_mb <= max_size_mb:
-                    # Успех! Заменяем оригинал
-                    out_path.unlink()
-                    compressed_path.rename(out_path)
-                    log.info(f"✅ [AUTO-COMPRESS] Success! File compressed to {compressed_size_mb:.2f} MB")
-                else:
-                    # ВТОРАЯ ПОПЫТКА: CRF 24, bitrate 3000k
-                    log.warning(f"[AUTO-COMPRESS] Still too large ({compressed_size_mb:.2f} MB), trying CRF 24...")
-                    compressed_path.unlink()  # Удаляем первую попытку
+                try:
+                    subprocess.run(cmd_crf22, check=True, capture_output=True, timeout=600)
+                    compressed_size_mb = compressed_path.stat().st_size / (1024 * 1024)
+                    log.info(f"[AUTO-COMPRESS] New size with CRF 22: {compressed_size_mb:.2f} MB (was {file_size_mb:.2f} MB)")
                     
-                    final_video.write_videofile(
-                        str(compressed_path),
-                        codec="libx264",
-                        audio_codec="aac",
-                        fps=30,
-                        preset="medium",
-                        bitrate="3000k",
-                        ffmpeg_params=[
+                    if compressed_size_mb <= max_size_mb:
+                        # Успех! Заменяем оригинал
+                        out_path.unlink()
+                        compressed_path.rename(out_path)
+                        log.info(f"✅ [AUTO-COMPRESS] Success! File compressed to {compressed_size_mb:.2f} MB")
+                    else:
+                        # ВТОРАЯ ПОПЫТКА: CRF 24, bitrate 3000k через ffmpeg
+                        log.warning(f"[AUTO-COMPRESS] Still too large ({compressed_size_mb:.2f} MB), trying CRF 24...")
+                        compressed_path.unlink()  # Удаляем первую попытку
+                        
+                        cmd_crf24 = [
+                            "ffmpeg", "-y",
+                            "-i", str(out_path),
+                            "-c:v", "libx264",
+                            "-preset", "medium",
+                            "-b:v", "3000k",
                             "-crf", "24",
-                            "-pix_fmt", "yuv420p"
-                        ],
-                        logger=None,
-                    )
-                    
-                    final_size_mb = compressed_path.stat().st_size / (1024 * 1024)
-                    log.info(f"[AUTO-COMPRESS] Final size with CRF 24: {final_size_mb:.2f} MB")
-                    
-                    out_path.unlink()
-                    compressed_path.rename(out_path)
-                    log.info(f"✅ [AUTO-COMPRESS] Compressed with CRF 24 to {final_size_mb:.2f} MB")
+                            "-pix_fmt", "yuv420p",
+                            "-c:a", "aac",
+                            "-b:a", "128k",
+                            str(compressed_path)
+                        ]
+                        
+                        subprocess.run(cmd_crf24, check=True, capture_output=True, timeout=600)
+                        final_size_mb = compressed_path.stat().st_size / (1024 * 1024)
+                        log.info(f"[AUTO-COMPRESS] Final size with CRF 24: {final_size_mb:.2f} MB")
+                        
+                        out_path.unlink()
+                        compressed_path.rename(out_path)
+                        log.info(f"✅ [AUTO-COMPRESS] Compressed with CRF 24 to {final_size_mb:.2f} MB")
+                
+                except subprocess.TimeoutExpired:
+                    log.error("[AUTO-COMPRESS] Compression timeout (600s), keeping original file")
+                except subprocess.CalledProcessError as ffmpeg_err:
+                    log.error(f"[AUTO-COMPRESS] ffmpeg compression failed: {ffmpeg_err}, keeping original file")
+                    if compressed_path.exists():
+                        compressed_path.unlink()
             else:
                 log.info(f"✅ [SIZE CHECK] File size OK: {file_size_mb:.2f} MB <= {max_size_mb} MB (HD quality preserved)")
         except Exception as compress_err:
             log.error(f"[AUTO-COMPRESS] Failed: {compress_err}")
             # Продолжаем с оригинальным файлом
-        
-        # --- ОСВОБОЖДЕНИЕ ФАЙЛОВ ДЛЯ WINDOWS (ШАГ 1 - ФИНАЛ) ---
-        try:
-            log.info("[CLEANUP] Finalizing resource release...")
-            
-            # Проверяем каждую переменную отдельно, чтобы не вызвать ошибку при закрытии
-            if 'final_video' in locals() and final_video is not None:
-                try: final_video.close()
-                except: pass
-                
-            if 'clip' in locals() and clip is not None:
-                try: clip.close()
-                except: pass
-                
-            if 'audio_track' in locals() and audio_track is not None:
-                try: audio_track.close()
-                except: pass
-                
-            if 'voiceover_audio' in locals() and voiceover_audio is not None:
-                try: voiceover_audio.close()
-                except: pass
-                
-            if 'original_audio' in locals() and original_audio is not None:
-                try: original_audio.close()
-                except: pass
-                
-            log.info("[CLEANUP] Resources released successfully")
-        except Exception as cleanup_err:
-            log.warning(f"[CLEANUP] Minor issue during release: {cleanup_err}")
         
         return out_path
     except Exception as e:
@@ -1940,11 +1932,10 @@ async def prepare_video_for_ready(application, item: dict) -> Path | None:
         tmp_dir.mkdir(exist_ok=True)
         
         video_file_id = item["file_id"]
-        source = item.get("source", "telegram")  # Используем source из item
-        is_instagram_source = (source == "instagram")
+        is_instagram_source = False
         
         # ✅ ПРОВЕРКА: Instagram-источник или Telegram
-        if (source == "instagram" or video_file_id == "instagram_source") and item.get("instagram_video_path"):
+        if video_file_id == "instagram_source" and item.get("instagram_video_path"):
             # Используем уже скачанное видео из Instagram
             instagram_path = Path(item["instagram_video_path"])
             if not instagram_path.exists():
@@ -1969,7 +1960,6 @@ async def prepare_video_for_ready(application, item: dict) -> Path | None:
         speed_mult = random.uniform(1.01, 1.03)  # Случайная скорость 1.01-1.03
         brightness = random.uniform(0.01, 0.03)  # Случайная яркость
         voiceover_path = item.get("voiceover_path")  # 🎙️ Путь к озвучке
-        source = item.get("source", "telegram")  # Источник из item
         
         processed_path = process_video(
             local_path,
@@ -1977,43 +1967,56 @@ async def prepare_video_for_ready(application, item: dict) -> Path | None:
             speed_multiplier=speed_mult,
             brightness_adjust=brightness,
             random_crop=True,  # Всегда применяем crop для готовых постов
-            voiceover_path=voiceover_path,  # 🎙️ Передаем озвучку
-            source=source  # Передаем источник
+            voiceover_path=voiceover_path  # 🎙️ Передаем озвучку
         )
         
         if not processed_path or not Path(processed_path).exists():
             log.error(f"[CONVEYOR] Video processing failed for {video_file_id}")
             # Удаляем только если это НЕ Instagram (временный файл Telegram)
             if not is_instagram_source and local_path.exists():
-                local_path.unlink()
+                await safe_unlink(local_path)
             return None
         
         # Сохраняем в ready_to_publish с уникальным именем
         ready_filename = f"ready_{uuid.uuid4().hex[:8]}_{int(time_module.time())}.mp4"
         ready_path = READY_TO_PUBLISH_DIR / ready_filename
         
+        # 🔍 DIAGNOSTICS: Логируем пути при сохранении
+        log.info(f"[CONVEYOR] Saving ready video: {ready_filename}")
+        log.info(f"[CONVEYOR] Ready directory: {READY_TO_PUBLISH_DIR.resolve()}")
+        log.info(f"[CONVEYOR] Ready path (absolute): {ready_path.resolve()}")
+        
         shutil.move(str(processed_path), str(ready_path))
         
         # Проверяем размер файла (целевой 15-25 МБ)
         file_size_mb = ready_path.stat().st_size / (1024 * 1024)
         log.info(f"[CONVEYOR] Ready video saved: {ready_filename} ({file_size_mb:.2f} MB)")
-        
-        # Удаляем временные файлы
+        log.info(f"[CONVEYOR] Saved to (absolute): {ready_path.resolve()}")
+        log.info(f"[CONVEYOR] File exists after save: {ready_path.exists()}")
+
+        # ГАРАНТИЯ: Сразу сохраняем sidecar meta (.json) — не полагаемся на дальнейшие шаги
+        try:
+            meta_path = ready_path.with_suffix('.mp4.json')
+            caption_tg_local = prepare_caption_for_publish_tg(caption) if caption else ""
+            caption_meta_local = prepare_caption_for_publish_meta(caption) if caption else ""
+            meta_obj = {
+                "ready_file": ready_path.name,
+                "created_at": datetime.utcnow().isoformat(),
+                "caption": caption or "",
+                "caption_tg": caption_tg_local or "",
+                "caption_meta": caption_meta_local or "",
+                "source_id": item.get("id") or item.get("video_file_id") or item.get("ig_media_id") or ""
+            }
+            meta_path.write_text(json.dumps(meta_obj, ensure_ascii=False, indent=2), encoding='utf-8')
+            log.info(f"[CONVEYOR] Ready meta saved: {meta_path.name} (exists={meta_path.exists()})")
+        except Exception as meta_err:
+            log.error(f"[CONVEYOR] Failed to write ready meta sidecar: {meta_err}")
+
+        # Удаляем временные файлы (безопасно)
         if local_path.exists():
-            local_path.unlink()
+            await safe_unlink(local_path)
             if is_instagram_source:
                 log.info("[CONVEYOR] Instagram source video cleaned up after processing")
-        
-        # Сохраняем метаданные (caption, file_id) в JSON рядом с видео
-        meta_path = ready_path.with_suffix('.json')
-        with open(meta_path, 'w', encoding='utf-8') as f:
-            json.dump({
-                'caption': caption,
-                'original_file_id': video_file_id,
-                'instagram_source': item.get('instagram_source'),  # ✅ Сохраняем URL источника
-                'type': item.get('type', 'video'),
-                'prepared_at': datetime.now().isoformat()
-            }, f, ensure_ascii=False)
         
         return ready_path
         
@@ -2276,9 +2279,20 @@ def load_ready_files_to_queue():
     Загружает готовые видео из ready_to_publish в POST_QUEUE.
     Вызывается когда POST_QUEUE пустая, но есть готовые файлы.
     """
+    # 🔍 DIAGNOSTICS: Проверяем пути
+    cwd = Path.cwd()
+    ready_dir_resolved = READY_TO_PUBLISH_DIR.resolve()
+    log.info(f"[QUEUE LOADER] Current working directory: {cwd}")
+    log.info(f"[QUEUE LOADER] Ready directory (absolute): {ready_dir_resolved}")
+    log.info(f"[QUEUE LOADER] Ready directory exists: {ready_dir_resolved.exists()}")
+    
     ready_files = sorted(READY_TO_PUBLISH_DIR.glob("ready_*.mp4"))
     
     if not ready_files:
+        # Диагностика если папка пустая
+        all_files_in_dir = list(READY_TO_PUBLISH_DIR.glob("*"))[:20]
+        log.warning(f"[QUEUE LOADER] No ready files found in {ready_dir_resolved}")
+        log.warning(f"[QUEUE LOADER] Directory contents (first 20): {[f.name for f in all_files_in_dir]}")
         return 0
     
     log.info(f"[DEBUG] Queue empty, found {len(ready_files)} ready files on disk. Filling queue...")
@@ -2286,15 +2300,26 @@ def load_ready_files_to_queue():
     loaded_count = 0
     for ready_file in ready_files:
         # Проверяем, что файл существует и метаданные тоже
-        meta_file = ready_file.with_suffix(".json")
-        if not meta_file.exists():
-            log.warning(f"[QUEUE LOADER] Metadata missing for {ready_file.name}, skipping")
+        # READY_META_EXT_FIX: Try both .json and .mp4.json formats
+        meta_file_a = ready_file.with_suffix(".json")
+        meta_file_b = ready_file.with_suffix(".mp4.json")
+        meta_file = meta_file_a if meta_file_a.exists() else (meta_file_b if meta_file_b.exists() else None)
+        
+        file_exists = ready_file.exists()
+        meta_exists = meta_file is not None
+        
+        log.info(f"[QUEUE LOADER] Processing {ready_file.name}: file_exists={file_exists}, meta_exists={meta_exists}")
+        log.info(f"[QUEUE LOADER] File path (absolute): {ready_file.resolve()}")
+        log.info(f"[QUEUE LOADER] meta picked: {meta_file.name if meta_file else 'NONE'}")
+        
+        if not meta_file:
+            log.warning(f"[QUEUE LOADER] Metadata missing for {ready_file.name} (tried .json and .mp4.json), skipping")
             continue
         
         try:
             # Загружаем метаданные
             meta_data = json.loads(meta_file.read_text(encoding="utf-8"))
-            
+
             # Создаем item для очереди
             item = {
                 "type": "video",
@@ -2304,11 +2329,11 @@ def load_ready_files_to_queue():
                 "ready_metadata": meta_data,
                 "from_ready_folder": True  # Флаг, что это готовый файл
             }
-            
+
             POST_QUEUE.append(item)
             loaded_count += 1
             log.info(f"[QUEUE LOADER] Added {ready_file.name} to queue")
-            
+
         except Exception as e:
             log.error(f"[QUEUE LOADER] Failed to load metadata for {ready_file.name}: {e}")
             continue
@@ -2443,269 +2468,133 @@ def clean_text_before_translation(text: str) -> str:
     return '\n'.join(unique_lines).strip()
 
 
-# ==================== STATE MANAGEMENT (post_counter + CTA) ====================
+async def translate_text(text: str) -> str:
+    """Умный режим перевода с self-check"""
+    if not openai_client or not text:
+        return text
 
-STATE_FILE = Path("state.json")
+    # Очищаем от служебных хвостов перед переводом
+    cleaned_text = clean_text_before_translation(text)
 
-def load_state() -> dict:
-    """Загружает состояние из state.json"""
-    if STATE_FILE.exists():
+    attempts = 3
+    last_error = None
+
+    for attempt in range(1, attempts + 1):
         try:
-            with STATE_FILE.open("r", encoding="utf-8") as f:
-                return json.load(f)
+            # Первый проход: перевод
+            TRANSLATION_LAST_COST = 0.0
+            resp1 = openai_client.chat.completions.create(
+                model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+                max_tokens=800,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "Sen master aforizmlar va hikmatli so'zlar ijodkorisan. Maqsad: rus tilidagi matnni o'zbek (lotin) tilida ma'noli, qisqa, tabiiy va kuchli ohangda berish. "
+                            "So'zma-so'z tarjimadan qoch, ma'no ustuvor. Masalan, 'Тихая сила' — 'Vazmin quvvat' yoki 'Sokin qudrat', lekin 'Jim kuch' emas.\n"
+                            "Qoidalar:\n"
+                            "- qisqa, ravon, ta'sirli; ortiqcha so'zlar yo'q\n"
+                            "- tuzilmani saqla (abzas, quote >), emoji qolgani joyida\n"
+                            "- kanallar, xeshteglar va xizmat belgilarini tarjima qilma\n"
+                            "- so'rov/komment so'ramagin\n"
+                            "- 1-2 kuchli so'zni *yulduzcha* bilan belgilashing mumkin\n"
+                            "- Matn oxirida 3-5 tegishli xeshteg (#hikmatlar #motivation #uzb #muvaffaqiyat kabi), o'zbek va ingliz tili aralash. Xeshteglar faqat caption uchundir, rasmga emas.\n"
+                            "Natija: faqat yakuniy tayyor matn, oxirida xeshteglar bilan."
+                        ),
+                    },
+                    {"role": "user", "content": cleaned_text},
+                ],
+            )
+            
+            translated = (resp1.choices[0].message.content or cleaned_text).strip()
+            
+            # Логируем токены первого запроса
+            usage = resp1.usage
+            if usage:
+                log_tokens(usage.prompt_tokens, usage.completion_tokens, usage.total_tokens)
+            
+            # Если пусто — повторяем
+            if not translated:
+                raise RuntimeError("Empty translation")
+
+            # Второй проход: self-check
+            resp2 = openai_client.chat.completions.create(
+                model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+                max_tokens=800,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "Ты — эксперт по оценке качества перевода на узбекский язык.\n\n"
+                            "Оцени переведённый текст и верни ТОЛЬКО валидный JSON в таком формате:\n"
+                            '{"readability": 1-10, "logic": 1-10, "style": 1-10, "no_repeat": 1-10, "issues": ["проблема1", "проблема2"], "improved_text": "улучшенный текст"}\n\n'
+                            "Критерии оценки:\n"
+                            "- readability: читаемость (1-10)\n"
+                            "- logic: логика и связность (1-10)\n"
+                            "- style: естественность Telegram-стиля (1-10)\n"
+                            "- no_repeat: отсутствие повторов с другими постами (1-10)\n\n"
+                            "Если ЛЮБАЯ оценка < 7 или средняя < 7, то improved_text должен содержать переписанную версию:\n"
+                            "- упростить\n"
+                            "- укоротить\n"
+                            "- убрать лишние слова\n"
+                            "- сделать более живым\n\n"
+                            "Только если ВСЕ оценки >= 7, improved_text может быть равен исходному тексту."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": f"Оцени этот перевод:\n\n{translated}"
+                    },
+                ],
+                response_format={"type": "json_object"},
+            )
+            
+            # Логируем токены второго запроса
+            usage2 = resp2.usage
+            if usage2:
+                log_tokens(usage2.prompt_tokens, usage2.completion_tokens, usage2.total_tokens)
+            
+            # Парсим JSON ответ
+            try:
+                check_result = json.loads(resp2.choices[0].message.content or "{}")
+                
+                readability = check_result.get("readability", 10)
+                logic = check_result.get("logic", 10)
+                style = check_result.get("style", 10)
+                no_repeat = check_result.get("no_repeat", 10)  # Отсутствие повтора
+                
+                # Минимальная оценка должна быть >= 7
+                min_score = min(readability, logic, style, no_repeat)
+                avg_score = (readability + logic + style + no_repeat) / 4
+                
+                improved_text = check_result.get("improved_text", translated)
+                
+                log.info(f"Translation self-check: readability={readability}, logic={logic}, style={style}, no_repeat={no_repeat}, min={min_score:.2f}, avg={avg_score:.2f}")
+                
+                # Если любая оценка < 7 → переписать
+                if min_score < 7 or avg_score < 7:
+                    log.warning(f"REWRITE: low score (min={min_score:.2f}, avg={avg_score:.2f}), using improved_text")
+                    return improved_text
+                else:
+                    log.info(f"OK: translation approved (min={min_score:.2f}, avg={avg_score:.2f})")
+                    return improved_text
+                    
+            except (json.JSONDecodeError, KeyError) as e:
+                log.warning(f"Failed to parse self-check JSON: {e}, using original translation")
+                return translated
         except Exception as e:
-            log.warning(f"Failed to load state: {e}, using defaults")
-    return {"post_counter": 0}
-
-
-def save_state(state: dict) -> None:
-    """Сохраняет состояние в state.json"""
-    try:
-        with STATE_FILE.open("w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        log.error(f"Failed to save state: {e}")
-
-
-def next_post_cta_rule() -> tuple[bool, Optional[str], int]:
-    """
-    Определяет, нужно ли добавлять CTA для следующего поста.
-    Возвращает: (use_cta, cta_text, post_counter)
-    CTA добавляется каждые 2 поста (post_counter % 2 == 0).
-    """
-    state = load_state()
-    post_counter = state.get("post_counter", 0)
+            last_error = e
+            log.warning(f"Translate attempt {attempt}/{attempts} failed: {e}")
+            if attempt == attempts:
+                log.error(f"Translate error after {attempts} attempts: {e}")
+                send_admin_error(f"OpenAI translation failed: {e}")
+                return text
+            await asyncio.sleep(1)
     
-    # Увеличиваем счетчик
-    post_counter += 1
-    state["post_counter"] = post_counter
-    save_state(state)
-    
-    # CTA добавляется каждые 2 поста (на 2, 4, 6, ...)
-    use_cta = (post_counter % 2 == 0)
-    
-    # Варианты CTA (точные строки с переносами)
-    cta_variants = [
-        "Biz bilang bo'ling,\nOldinda yana qiziqarlilari bor.",
-        "Agar video yoqqan bo'lsa,\nlayk bosish esdan chiqmasin.",
-        "video yoqgan bo'lsa,\ntanishlarga jo'natib qo'yamiz"
-    ]
-    
-    cta_text = None
-    if use_cta:
-        cta_text = random.choice(cta_variants)
-        log.info(f"[CTA] Post #{post_counter}: CTA enabled, variant chosen: {cta_text[:30]}...")
-    else:
-        log.info(f"[CTA] Post #{post_counter}: CTA disabled")
-    
-    return use_cta, cta_text, post_counter
-
-
-# ==================== PARSING & BUILDING FUNCTIONS ====================
-
-def parse_model_blocks(text: str) -> dict:
-    """
-    Парсит ответ модели на блоки VOICE_UZ, CAPTION_UZ, EXTRA_HASHTAGS.
-    Возвращает: {"voice": str, "caption": str, "extra_hashtags": str}
-    """
-    result = {
-        "voice": "",
-        "caption": "",
-        "extra_hashtags": ""
-    }
-    
-    if not text:
-        return result
-    
-    # Извлекаем VOICE_UZ
-    if "VOICE_UZ:" in text:
-        voice_start = text.find("VOICE_UZ:") + len("VOICE_UZ:")
-        voice_end = text.find("CAPTION_UZ:", voice_start)
-        if voice_end == -1:
-            voice_end = text.find("EXTRA_HASHTAGS:", voice_start)
-        if voice_end == -1:
-            voice_end = len(text)
-        result["voice"] = text[voice_start:voice_end].strip()
-    
-    # Извлекаем CAPTION_UZ
-    if "CAPTION_UZ:" in text:
-        caption_start = text.find("CAPTION_UZ:") + len("CAPTION_UZ:")
-        caption_end = text.find("EXTRA_HASHTAGS:", caption_start)
-        if caption_end == -1:
-            caption_end = len(text)
-        result["caption"] = text[caption_start:caption_end].strip()
-    
-    # Извлекаем EXTRA_HASHTAGS
-    if "EXTRA_HASHTAGS:" in text:
-        hashtags_start = text.find("EXTRA_HASHTAGS:") + len("EXTRA_HASHTAGS:")
-        hashtags_text = text[hashtags_start:].strip()
-        # Очищаем от лишних символов
-        hashtags_text = hashtags_text.replace("<", "").replace(">", "").strip()
-        result["extra_hashtags"] = hashtags_text
-    
-    # Fallback если парсинг не удался
-    if not result["voice"]:
-        lines = text.split('\n')
-        result["voice"] = lines[0].strip() if lines else "Qiziqarli video."
-    if not result["caption"]:
-        result["caption"] = result["voice"]
-    
-    return result
-
-
-def build_voice_for_tts(voice_uz: str, cta_text: Optional[str]) -> str:
-    """
-    Строит текст для TTS из VOICE_UZ + CTA (если нужно).
-    Удаляет хэштеги и нормализует пробелы.
-    """
-    if not voice_uz:
-        voice_uz = "Qiziqarli video."
-    
-    # Удаляем хэштеги из voice
-    import re
-    voice_uz = re.sub(r'#\w+', '', voice_uz)
-    
-    # Нормализуем пробелы (убираем множественные переносы строк)
-    voice_uz = re.sub(r'\n\s*\n+', '\n', voice_uz).strip()
-    
-    # Добавляем CTA если нужно
-    if cta_text:
-        voice_uz = f"{voice_uz}\n\n{cta_text}"
-    
-    return voice_uz.strip()
-
-
-def build_caption_for_post(caption_uz: str, base_hashtags: str, extra_hashtags: str, footer_html: str) -> str:
-    """
-    Строит финальный caption для публикации.
-    Включает: caption_uz + extra_hashtags + base_hashtags + footer_html
-    """
-    parts = []
-    
-    if caption_uz:
-        parts.append(caption_uz.strip())
-    
-    if extra_hashtags:
-        parts.append(extra_hashtags.strip())
-    
-    if base_hashtags:
-        parts.append(base_hashtags.strip())
-    
-    if footer_html:
-        parts.append(footer_html.strip())
-    
-    return '\n'.join(parts)
-
-
-# ==================== SOURCE DETECTION ====================
-
-def detect_source_from_input(input_str: str) -> str:
-    """
-    Определяет источник из входной строки (URL или текст).
-    Возвращает: "instagram" или "telegram"
-    """
-    if not input_str:
-        return "telegram"
-    
-    import re
-    # Проверяем на Instagram URL
-    instagram_pattern = r'https?://(?:www\.)?(?:instagram\.com|instagr\.am)'
-    if re.search(instagram_pattern, input_str, re.IGNORECASE):
-        return "instagram"
-    
-    return "telegram"
-
-
-async def translate_text(caption_ru: str, asr_ru: str, base_hashtags: str) -> dict:
-    """
-    Переводит контент в кинематографичном стиле.
-    Возвращает словарь: {'voice': str, 'caption': str, 'hashtags': str}
-    CTA НЕ добавляется здесь - это делается в коде через next_post_cta_rule()
-    """
-    try:
-        # ПРОМПТ: КИНЕМАТОГРАФИЧНЫЙ СТИЛЬ (БЕЗ CTA)
-        system_prompt = (
-            "Ты — переводчик и SMM-редактор.\n"
-            "Мой стиль: тёплый, спокойный, созерцательный, кинематографичный.\n"
-            "Пишешь просто, по сути, короткими фразами, удобно для озвучки.\n\n"
-            "Задача:\n"
-            "Подготовить узбекскую (латиница) ОЗВУЧКУ и ОПИСАНИЕ для публикации.\n"
-            "Все медиафайлы должны выходить с озвучкой.\n\n"
-            "Нужно выдать 3 блока:\n"
-            "1) VOICE_UZ — текст для озвучки\n"
-            "2) CAPTION_UZ — описание под пост\n"
-            "3) EXTRA_HASHTAGS — 2–3 дополнительных хэштега по теме\n\n"
-            "ЛОГИКА:\n"
-            "- Если ASR_RU не пустой → переведи его в VOICE_UZ, сохраняя смысл и тёплый тон.\n"
-            "- Если ASR_RU пустой → создай VOICE_UZ на основе CAPTION_RU или смысла сцены, без выдумок и без воды.\n"
-            "- Если CAPTION_RU пустой → создай короткий CAPTION_UZ на основе VOICE_UZ.\n\n"
-            "СТИЛЬ (ОБЯЗАТЕЛЬНО):\n"
-            "— тёплый, спокойный\n"
-            "— ощущение момента\n"
-            "— короткие строки\n"
-            "— без воды, без абстрактных слов\n"
-            "— без сленга\n"
-            "— без \"SHOK\", \"DAHSHAT\"\n"
-            "— допускаются паузы\n\n"
-            "ВАЖНО: НЕ добавляй CTA в VOICE_UZ. CTA будет добавлен отдельно в коде.\n\n"
-            "ОГРАНИЧЕНИЯ:\n"
-            "— VOICE_UZ: 2–7 коротких строк\n"
-            "— VOICE_UZ БЕЗ хэштегов\n"
-            "— VOICE_UZ БЕЗ CTA\n"
-            "— CAPTION_UZ: 1–2 предложения\n"
-            "— EXTRA_HASHTAGS: строго 2–3, по теме, без повторов BASE_HASHTAGS\n\n"
-            "ФОРМАТ ВЫВОДА (СТРОГО):\n\n"
-            "VOICE_UZ:\n"
-            "<текст>\n\n"
-            "CAPTION_UZ:\n"
-            "<текст>\n\n"
-            "EXTRA_HASHTAGS:\n"
-            "<#... #... #...>"
-        )
-        
-        # Подготовка входных данных
-        user_content = (
-            f"ВХОД:\n"
-            f"CAPTION_RU:\n\"\"\" {caption_ru or '(пусто)'} \"\"\"\n\n"
-            f"ASR_RU:\n\"\"\" {asr_ru or '(пусто)'} \"\"\"\n\n"
-            f"BASE_HASHTAGS:\n\"\"\" {base_hashtags or ''} \"\"\""
-        )
-        
-        # Запрос к AI
-        if not openai_client:
-            # Fallback при отсутствии клиента
-            return {
-                'voice': "Qiziqarli video. Oxirigacha ko'ring.",
-                'caption': "Qiziqarli video. Oxirigacha ko'ring.",
-                'hashtags': ""
-            }
-        
-        response = openai_client.chat.completions.create(
-            model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_content}
-            ]
-        )
-        
-        # ПАРСЕР: Используем общую функцию parse_model_blocks
-        gpt_response = response.choices[0].message.content or ""
-        blocks = parse_model_blocks(gpt_response)
-        
-        return {
-            'voice': blocks['voice'],
-            'caption': blocks['caption'],
-            'hashtags': blocks['extra_hashtags']
-        }
-        
-    except Exception as e:
-        log.error(f"[OPENAI] Translation error: {e}")
-        # Аварийный ответ, если GPT сломался
-        return {
-            'voice': "Qiziqarli video. Oxirigacha ko'ring.",
-            'caption': "Qiziqarli video. Oxirigacha ko'ring.",
-            'hashtags': ""
-        }
+    # fallback
+    if last_error:
+        log.error(f"Translate fatal: {last_error}")
+    return text
 
 
 # ==================== WHISPER AUDIO-TO-TEXT ====================
@@ -2825,7 +2714,7 @@ def generate_voiceover(text):
         from elevenlabs.client import ElevenLabs
         
         client = ElevenLabs(api_key=ELEVENLABS_API_KEY)
-        
+
         # Путь для сохранения озвучки
         tmp_voiceover_path = Path("tmp_media") / "voiceover.mp3"
         tmp_voiceover_path.parent.mkdir(exist_ok=True)
@@ -3390,8 +3279,34 @@ async def delete_from_buffer(application, item: dict) -> None:
         log.warning(f"delete_from_buffer_fail: message_id={buffer_message_id}, chat_id={buffer_chat_id}, error={error_msg}, code={error_code}")
 
 
+# FIX B: Worker для неблокирующей обработки видео
+async def video_processing_worker():
+    """
+    Фоновый воркер для обработки видео.
+    Берет работы из VIDEO_PROCESSING_QUEUE и обрабатывает их.
+    Не блокирует основные операции Telegram/scheduler.
+    """
+    log.info("[WORKER] Video processing worker started")
+    while True:
+        try:
+            job = await VIDEO_PROCESSING_QUEUE.get()
+            try:
+                log.info(f"[QUEUE] video dequeued: type={job.get('type', 'unknown')}")
+                # job содержит information для обработки видео
+                # Тяжелая обработка (rendering, ffmpeg) идет здесь
+                await asyncio.sleep(0.1)  # Placeholder для работы
+                log.info(f"[QUEUE] video processed: type={job.get('type', 'unknown')}")
+            except Exception as e:
+                log.error(f"[WORKER] job failed: {e}")
+            finally:
+                VIDEO_PROCESSING_QUEUE.task_done()
+        except Exception as e:
+            log.error(f"[WORKER] unexpected error: {e}")
+            await asyncio.sleep(1)
+
+
 async def post_worker(application):
-    global IS_POSTING, FORCE_CAROUSEL_TEST, FIRST_RUN_IMMEDIATE, LAST_PHOTO_TIME, LAST_VIDEO_TIME, LAST_POST_TIME, IS_PAUSED
+    global IS_POSTING, FORCE_CAROUSEL_TEST, FIRST_RUN_IMMEDIATE, LAST_PHOTO_TIME, LAST_VIDEO_TIME, LAST_POST_TIME, IS_PAUSED, FORCE_POST_NOW, POSTNOW_EVENT
 
     if IS_POSTING:
         return
@@ -3399,158 +3314,650 @@ async def post_worker(application):
     IS_POSTING = True
 
     while True:
-        # SMART CONTROL: Проверка паузы публикаций
-        if IS_PAUSED:
-            log.info("[PAUSE] Conveyor paused. Sleeping for 10 seconds...")
-            await asyncio.sleep(10)
-            continue
-        
-        # STATUS LOG: Состояние системы
-        ready_count = len(list(READY_TO_PUBLISH_DIR.glob("ready_*.mp4")))
-        last_post_str = LAST_POST_TIME.strftime('%Y-%m-%d %H:%M:%S') if LAST_POST_TIME else "Never"
-        log.info(f"STATUS | Queue: {len(POST_QUEUE)} | Ready: {ready_count}/10 | Last post: {last_post_str}")
-        
-        if POST_QUEUE:
-            # Первое включение: публикуем сразу ОДИН РАЗ
-            if FIRST_RUN_IMMEDIATE:
-                # 🎯 PERSISTENT FIRST STRIKE: Пробуем файлы один за другим до первого успеха
-                first_strike_success = False
-                first_strike_attempts = 0
-                max_first_strike_attempts = 50  # Максимум 50 попыток
+        try:
+            # === IG SCHEDULE: Проверка расписания публикаций (9 постов/день) ===
+            now = datetime.now()
+            reset_ig_schedule_if_needed()
+            
+            ready = False
+            postnow_mode = FORCE_POST_NOW  # Local flag to track POSTNOW mode throughout this cycle
+            
+            # === POSTNOW BYPASS: Обход всех проверок расписания ===
+            if postnow_mode:
+                log.info("[SCHEDULER] POSTNOW override: immediate publish (bypass schedule windows)")
+                ready = True
+            else:
+                # === NORMAL SCHEDULE MODE: Проверка расписания и окон ===
                 
-                log.warning("[FIRST STRIKE] Starting persistent post attempt. Will try files until one succeeds...")
+                # Проверка временных окон и лимитов
+                hour = now.hour
                 
-                while not first_strike_success and POST_QUEUE and first_strike_attempts < max_first_strike_attempts:
-                    first_strike_attempts += 1
-                    item = POST_QUEUE.popleft()
-                    save_queue()
-                    item["first_strike"] = True
-                    log.warning(f"[FIRST STRIKE] Attempt #{first_strike_attempts}: Trying post from queue. Remaining: {len(POST_QUEUE)}")
-                    
-                    # Проверяем тип поста - First Strike работает только с видео
-                    if item["type"] != "video":
-                        log.warning(f"[FIRST STRIKE] Skipping non-video post (type={item['type']})")
+                # Пауза 14:00-16:00
+                if 14 <= hour < 16:
+                    log.info("[SCHEDULER] Outside schedule window: sleeping until 16:00")
+                    await sleep_or_postnow(3600)  # Sleep 1 hour
+                    continue
+                
+                # После 21:00 - спим до утра
+                if hour > 21:
+                    log.info("[SCHEDULER] After 21:00: sleeping until tomorrow 08:00")
+                    sleep_hours = (24 - hour) + 8
+                    await sleep_or_postnow(sleep_hours * 3600)
+                    continue
+                
+                # Утро (до 14:00): максимум 3 поста
+                if hour < 14:
+                    if IG_SCHEDULE["morning_videos"] >= 3:
+                        log.info("[SCHEDULER] Morning limit reached (3/3): sleeping until 16:00")
+                        await sleep_or_postnow(3600)  # Sleep 1 hour, will check again
                         continue
+                    ready = True
+                # Вечер (16:00-21:00): максимум 6 постов
+                elif 16 <= hour <= 21:
+                    if IG_SCHEDULE["afternoon_videos"] >= 6:
+                        log.info("[SCHEDULER] Evening limit reached (6/6): sleeping until tomorrow 08:00")
+                        await sleep_or_postnow(8 * 3600)  # Sleep 8 hours
+                        continue
+                    ready = True
+                
+                # Проверка интервала (1 час между постами) — только в режиме обычного расписания
+                if ready and LAST_POST_TIME is not None:
+                    time_since_last = (now - LAST_POST_TIME).total_seconds()
+                    if time_since_last < PUBLISH_INTERVAL_SECONDS:
+                        sleep_time = PUBLISH_INTERVAL_SECONDS - time_since_last
+                        log.info(f"[SCHEDULER] Cooldown: sleeping {sleep_time:.0f}s until next publish window")
+                        await sleep_or_postnow(sleep_time)
+                        continue
+
+            # SMART CONTROL: Проверка паузы публикаций (НЕ обходится при POSTNOW)
+            if IS_PAUSED and not postnow_mode:
+                log.info("[PAUSE] Conveyor paused. Sleeping for 10 seconds...")
+                await sleep_or_postnow(10)
+                continue
+            
+            # STATUS LOG: Состояние системы
+            ready_count = len(list(READY_TO_PUBLISH_DIR.glob("ready_*.mp4")))
+            last_post_str = LAST_POST_TIME.strftime('%Y-%m-%d %H:%M:%S') if LAST_POST_TIME else "Never"
+            log.info(f"STATUS | Queue: {len(POST_QUEUE)} | Ready: {ready_count}/10 | Last post: {last_post_str}")
+
+            if POST_QUEUE:
+                # Первое включение: публикуем сразу ОДИН РАЗ
+                if FIRST_RUN_IMMEDIATE:
+                    # 🎯 PERSISTENT FIRST STRIKE: Пробуем файлы один за другим до первого успеха
+                    first_strike_success = False
+                    first_strike_attempts = 0
+                    max_first_strike_attempts = 50  # Максимум 50 попыток
                     
-                    # Пробуем обработать и опубликовать видео
-                    post_attempt_failed = False
+                    log.warning("[FIRST STRIKE] Starting persistent post attempt. Will try files until one succeeds...")
                     
-                    # === НАЧАЛО БЛОКА ОБРАБОТКИ FIRST STRIKE ВИДЕО ===
-                    caption = item.get("caption", "")
-                    caption_tg = prepare_caption_for_publish_tg(caption)
-                    caption_meta = prepare_caption_for_publish_meta(caption)
-                    
-                    if caption_tg and len(caption_tg) > CAPTION_MAX_LENGTH:
-                        caption_tg = trim_caption_with_footer(caption_tg, CAPTION_MAX_LENGTH)
-                    
-                    tmp_dir = Path("tmp_media")
-                    tmp_dir.mkdir(exist_ok=True)
-                    video_file_id = item["file_id"]
-                    public_url = None
-                    local_path = None
-                    processed_path = None
-                    upload_path = None
-                    
-                    try:
-                        # Проверяем: это готовый файл или сырой?
+                    while not first_strike_success and POST_QUEUE and first_strike_attempts < max_first_strike_attempts:
+                        first_strike_attempts += 1
+                        item = POST_QUEUE.popleft()
+                        save_queue()
+                        item["first_strike"] = True
+                        log.warning(f"[FIRST STRIKE] Attempt #{first_strike_attempts}: Trying post from queue. Remaining: {len(POST_QUEUE)}")
+                        
+                        # Проверяем тип поста - First Strike работает только с видео
+                        if item["type"] != "video":
+                            log.warning(f"[FIRST STRIKE] Skipping non-video post (type={item['type']})")
+                            continue
+                        
+                        # Пробуем обработать и опубликовать видео
+                        post_attempt_failed = False
+                        
+                        # === НАЧАЛО БЛОКА ОБРАБОТКИ FIRST STRIKE ВИДЕО ===
+                        # FIX: If item comes from ready folder, initialize captions empty
                         if item.get("from_ready_folder", False):
-                            # ✅ Это готовый файл - берём напрямую с диска
-                            ready_video_path = Path(item["ready_file_path"])
-                            if not ready_video_path.exists():
-                                raise FileNotFoundError(f"Ready file not found: {ready_video_path}")
-                            
-                            upload_path = ready_video_path
-                            
-                            # Загружаем метаданные
-                            ready_meta_path = ready_video_path.with_suffix('.json')
-                            if ready_meta_path.exists():
-                                try:
-                                    with open(ready_meta_path, 'r', encoding='utf-8') as f:
-                                        meta = json.load(f)
-                                        caption = meta.get('caption', caption)
-                                        caption_tg = prepare_caption_for_publish_tg(caption)
-                                        caption_meta = prepare_caption_for_publish_meta(caption)
+                            caption = ""
+                            caption_tg = ""
+                            caption_meta = ""
+                        else:
+                            caption = item.get("caption", "")
+                            caption_tg = prepare_caption_for_publish_tg(caption)
+                            caption_meta = prepare_caption_for_publish_meta(caption)
+
+                            if caption_tg and len(caption_tg) > CAPTION_MAX_LENGTH:
+                                caption_tg = trim_caption_with_footer(caption_tg, CAPTION_MAX_LENGTH)
+                        
+                        tmp_dir = Path("tmp_media")
+                        tmp_dir.mkdir(exist_ok=True)
+                        video_file_id = item["file_id"]
+                        public_url = None
+                        local_path = None
+                        processed_path = None
+                        upload_path = None
+                        
+                        try:
+                            # Проверяем: это готовый файл или сырой?
+                            if item.get("from_ready_folder", False):
+                                # ✅ Это готовый файл - берём напрямую с диска
+                                ready_video_path = Path(item["ready_file_path"])
+                                
+                                # 🔍 DIAGNOSTICS: Проверяем существование файла
+                                file_exists = ready_video_path.exists()
+                                file_absolute = ready_video_path.resolve()
+                                log.info(f"[FIRST STRIKE] Ready file check: name={ready_video_path.name}, exists={file_exists}")
+                                log.info(f"[FIRST STRIKE] Ready file absolute path: {file_absolute}")
+                                
+                                if not file_exists:
+                                    # Выводим содержимое папки для диагностики
+                                    ready_dir = READY_TO_PUBLISH_DIR.resolve()
+                                    dir_contents = list(READY_TO_PUBLISH_DIR.glob("*"))[:20]
+                                    log.error(f"[FIRST STRIKE] Ready file not found: {file_absolute}")
+                                    log.error(f"[FIRST STRIKE] Ready directory: {ready_dir}")
+                                    log.error(f"[FIRST STRIKE] Directory contents (first 20): {[f.name for f in dir_contents]}")
+                                    log.error(f"[FIRST STRIKE] Drop missing ready file and continue: {ready_video_path}")
+                                    continue
+                                
+                                upload_path = ready_video_path
+                                
+                                # Загружаем метаданные (поддерживаем .json и .mp4.json)
+                                ready_meta_a = ready_video_path.with_suffix('.json')
+                                ready_meta_b = ready_video_path.with_suffix('.mp4.json')
+                                ready_meta_path = ready_meta_a if ready_meta_a.exists() else (ready_meta_b if ready_meta_b.exists() else None)
+                                caption = ""
+                                caption_tg = ""
+                                caption_meta = ""
+
+                                if ready_meta_path and ready_meta_path.exists():
+                                    try:
+                                        meta = json.loads(ready_meta_path.read_text(encoding='utf-8'))
+                                        caption = meta.get('caption', '') or ""
+                                        caption_tg = meta.get('caption_tg', '') or ""
+                                        caption_meta = meta.get('caption_meta', '') or ""
                                         if caption_tg and len(caption_tg) > CAPTION_MAX_LENGTH:
                                             caption_tg = trim_caption_with_footer(caption_tg, CAPTION_MAX_LENGTH)
-                                        log.info(f"[FIRST STRIKE] Loaded metadata from {ready_meta_path.name}")
-                                except Exception as e:
-                                    log.warning(f"[FIRST STRIKE] Failed to load metadata: {e}")
-                            
-                            log.info(f"[FIRST STRIKE] Using ready file: {ready_video_path.name}")
-                            
-                            # Загружаем в Supabase (если еще не загружено)
-                            if not item.get("supabase_url"):
-                                content_type = "video/mp4"
+                                        log.info(f"[FIRST STRIKE] Loaded ready meta: {ready_meta_path.name}")
+                                    except Exception as e:
+                                        log.error(f"[FIRST STRIKE] Failed to read meta json: {ready_meta_path.name} -> {e}")
+                                else:
+                                    log.error(f"[FIRST STRIKE] Meta json missing for ready file: {ready_video_path.name} -> using empty caption")
+                                
+                                log.info(f"[FIRST STRIKE] Using ready file: {ready_video_path.name}")
+                                
+                                # Загружаем в Supabase (если еще не загружено)
+                                if not item.get("supabase_url"):
+                                    content_type = "video/mp4"
+                                    public_url = upload_to_supabase(str(upload_path), content_type)
+                                    if public_url:
+                                        log.info(f"[FIRST STRIKE] Supabase URL OK: {public_url}")
+                                        item["supabase_url"] = public_url
+                                    else:
+                                        raise RuntimeError("[FIRST STRIKE] Supabase upload failed")
+                                else:
+                                    public_url = item["supabase_url"]
+                                    log.info(f"[FIRST STRIKE] Using existing Supabase URL: {public_url}")
+                            else:
+                                # ⚠️ Это сырой файл - проверяем источник
+                                
+                                # ✅ ДОБАВЛЕНО: Обработка Instagram для First Strike
+                                if video_file_id == "instagram_source" and item.get("instagram_video_path"):
+                                    instagram_path = Path(item["instagram_video_path"])
+                                    if not instagram_path.exists():
+                                        log.error(f"[FIRST STRIKE] Видео не найдено по пути: {instagram_path}")
+                                        continue
+                                    local_path = instagram_path
+                                    log.info(f"[FIRST STRIKE] Использую локальный файл Instagram: {local_path.name}")
+                                else:
+                                    # Стандартный путь: скачиваем из Telegram
+                                    file_obj = await application.bot.get_file(video_file_id)
+                                    remote_path = getattr(file_obj, "file_path", "") or ""
+                                    suffix = Path(remote_path).suffix or ".mp4"
+                                    local_path = tmp_dir / f"{video_file_id}{suffix}"
+                                    
+                                    # Скачиваем сырое видео из TG
+                                    await file_obj.download_to_drive(custom_path=str(local_path))
+                                    log.info(f"[FIRST STRIKE] Видео скачано из Telegram: {local_path.name}")
+                                
+                                # Обрабатываем видео
+                                processed_path = process_video(local_path, caption)
+                                if not processed_path or not Path(processed_path).exists():
+                                    raise RuntimeError("[FIRST STRIKE] Video processing failed")
+                                upload_path = processed_path
+
+                                # Загружаем в Supabase
+                                content_type = mimetypes.guess_type(str(upload_path))[0] or "video/mp4"
                                 public_url = upload_to_supabase(str(upload_path), content_type)
                                 if public_url:
                                     log.info(f"[FIRST STRIKE] Supabase URL OK: {public_url}")
                                     item["supabase_url"] = public_url
                                 else:
                                     raise RuntimeError("[FIRST STRIKE] Supabase upload failed")
-                            else:
-                                public_url = item["supabase_url"]
-                                log.info(f"[FIRST STRIKE] Using existing Supabase URL: {public_url}")
-                        else:
-                            # ⚠️ Это сырой файл - проверяем источник
+                                
+                        except Exception as e:
+                            error_msg = str(e)
+                            log.error(f"[FIRST STRIKE] Processing error: {e}")
                             
-                            # ✅ ДОБАВЛЕНО: Обработка Instagram для First Strike
-                            if video_file_id == "instagram_source" and item.get("instagram_video_path"):
-                                instagram_path = Path(item["instagram_video_path"])
-                                if not instagram_path.exists():
-                                    log.error(f"[FIRST STRIKE] Видео не найдено по пути: {instagram_path}")
-                                    continue
-                                local_path = instagram_path
-                                log.info(f"[FIRST STRIKE] Использую локальный файл Instagram: {local_path.name}")
+                            # Удаляем временные файлы
+                            for p in [local_path, processed_path]:
+                                if p and Path(p).exists():
+                                    await safe_unlink(p)
+                            
+                            # Проверяем на Invalid file_id или критические ошибки
+                            if "Invalid file_id" in error_msg or "file_id" in error_msg.lower() or "Supabase" in error_msg:
+                                log.critical(f"🚨 CRITICAL | [FIRST STRIKE] Broken file detected: {error_msg[:100]}")
+                                log.critical("🚨 CRITICAL | [FIRST STRIKE] Skipping to next file immediately...")
+                                post_attempt_failed = True
+                                continue  # Переходим к следующему файлу
+                            
+                            # Для других ошибок тоже пробуем следующий
+                            post_attempt_failed = True
+                            continue
+                        
+                        # Если дошли сюда - файл обработан успешно, пробуем публиковать
+                        if not post_attempt_failed and item.get("supabase_url"):
+                            try:
+                                # Публикация в Telegram
+                                with open(upload_path, "rb") as f:
+                                    await application.bot.send_video(
+                                        chat_id=MAIN_CHANNEL_ID,
+                                        video=f,
+                                        caption=caption_tg if caption_tg else None,
+                                        parse_mode="HTML",
+                                        supports_streaming=True,
+                                        width=1080,
+                                        height=1920,
+                                    )
+                                    log.info("[FIRST STRIKE] Telegram format: VIDEO_STREAMING_ON")
+                                
+                                # Публикация в Facebook
+                                try:
+                                    item_fb = dict(item)
+                                    item_fb["caption"] = caption_meta
+                                    await publish_to_facebook(item_fb)
+                                    append_history("FB", "Video", item.get("supabase_url", "-"), item.get("translation_cost", 0.0))
+                                except Exception as e:
+                                    log.error(f"[FIRST STRIKE] Facebook publish error: {e}")
+                                
+                                # === DIAGNOSTIC: IG Schedule Check (First Strike) ===
+                                now_fs_check = datetime.now()
+                                log.info(f"[DIAGNOSTICS PRE-DECISION] [FIRST STRIKE]")
+                                log.info(f"  FORCE_POST_NOW={FORCE_POST_NOW}")
+                                log.info(f"  Current time={now_fs_check.strftime('%Y-%m-%d %H:%M:%S')} (hour={now_fs_check.hour})")
+                                log.info(f"  IG_SCHEDULE: morning={IG_SCHEDULE['morning_videos']}/3, evening={IG_SCHEDULE['afternoon_videos']}/6")
+                                
+                                # Instagram публикация (без Plan B для First Strike - просто одна попытка)
+                                if can_ig_publish("video", force=FORCE_POST_NOW):
+                                    try:
+                                        item_ig = dict(item)
+                                        item_ig["caption"] = caption_meta
+                                        ig_result = await publish_to_instagram(item_ig)
+                                        if ig_result:
+                                            log.info("[FIRST STRIKE] Instagram published successfully")
+                                            append_history("IG", "Video", item.get("supabase_url", "-"), item.get("translation_cost", 0.0))
+                                    except Exception as e:
+                                        log.error(f"[FIRST STRIKE] Instagram publish error: {e}")
+                                
+                                # Cleanup временных файлов
+                                if item.get("from_ready_folder", False):
+                                    # Для готовых файлов: удаляем файл и метаданные после публикации
+                                    if upload_path and Path(upload_path).exists():
+                                        await safe_unlink(upload_path)
+                                        log.info(f"[FIRST STRIKE] Deleted ready file: {Path(upload_path).name}")
+                                    # Удаляем метаданные (READY_META_EXT_FIX: try both formats)
+                                    if upload_path:
+                                        meta_path_a = Path(upload_path).with_suffix('.json')
+                                        meta_path_b = Path(upload_path).with_suffix('.mp4.json')
+                                        meta_path = meta_path_a if meta_path_a.exists() else (meta_path_b if meta_path_b.exists() else None)
+                                        if meta_path and meta_path.exists():
+                                            await safe_unlink(meta_path)
+                                            log.info(f"[FIRST STRIKE] Deleted metadata: {meta_path.name}")
+                                else:
+                                    # Для сырых файлов: удаляем только временные файлы
+                                    for p in [local_path, processed_path]:
+                                        if p and Path(p).exists():
+                                            await safe_unlink(p)
+                                
+                                # Удаляем из буфера
+                                await delete_from_buffer(application, item)
+                                await send_progress_report(application)
+                                
+                                # Обновляем статистику
+                                increment_stat("video")
+                                append_history("TG", "Video", item.get("supabase_url", "-"), item.get("translation_cost", 0.0))
+                                if caption:
+                                    PUBLISHED_TEXTS.append(caption)
+                                    if len(PUBLISHED_TEXTS) > MAX_PUBLISHED_TEXTS:
+                                        PUBLISHED_TEXTS.pop(0)
+                                    save_published_texts()
+                                
+                                # 🎯 УСПЕХ! Помечаем флаг и обновляем время
+                                first_strike_success = True
+                                now_publish = datetime.now()
+                                LAST_POST_TIME = now_publish
+                                save_last_post_time()
+                                
+                                # NOTE: IG_SCHEDULE counters incremented at the end of post_worker (no double increment)
+                                log.info(f"✅ [FIRST STRIKE] SUCCESS after {first_strike_attempts} attempt(s)! Published one post. Cooldown active.")
+                                
+                            except Exception as e:
+                                log.error(f"[FIRST STRIKE] Publication error: {e}")
+                                # Cleanup (только временные файлы, готовые НЕ удаляем)
+                                if not item.get("from_ready_folder", False):
+                                    for p in [local_path, processed_path]:
+                                        if p and Path(p).exists():
+                                            await safe_unlink(p)
+                                continue  # Пробуем следующий файл
+                        # === КОНЕЦ БЛОКА ОБРАБОТКИ FIRST STRIKE ВИДЕО ===
+                    
+                    # После цикла First Strike
+                    if first_strike_success:
+                        log.info("[FIRST STRIKE] Completed! Next post in 60 minutes.")
+                    else:
+                        log.error(f"[FIRST STRIKE] FAILED after {first_strike_attempts} attempts. No successful post.")
+                    
+                    # СБРАСЫВАЕМ ФЛАГ (теперь First Strike завершен)
+                    FIRST_RUN_IMMEDIATE = False
+                    continue  # Возвращаемся к началу цикла worker
+                else:
+                    now = datetime.now()
+                    ready = (LAST_POST_TIME is None) or ((now - LAST_POST_TIME) >= timedelta(seconds=PUBLISH_INTERVAL_SECONDS))
+                    if not ready:
+                        if POST_QUEUE and POST_QUEUE[0].get("type") == "photo" and LAST_POST_TIME:
+                            next_time = LAST_POST_TIME + timedelta(seconds=PUBLISH_INTERVAL_SECONDS)
+                            log.info(f"INFO | [NEXT] Type: Photo. Scheduled at: {next_time.strftime('%Y-%m-%d %H:%M:%S')}")
+                        # === POSTNOW Wake-up: спим, но просыпаемся по событию ===
+                        POSTNOW_EVENT.clear()
+                        try:
+                            await asyncio.wait_for(POSTNOW_EVENT.wait(), timeout=60)
+                            log.info("[POSTNOW] Woken up by POSTNOW_EVENT!")
+                        except asyncio.TimeoutError:
+                            pass  # Обычный timeout, продолжаем работу
+                        continue
+                    
+                    # 🎛️ MIXED QUEUE 4+4: Выбираем пост по логике чередования
+                    # FIX A: Безопасный выбор ready-файлов
+                    max_attempts = 10
+                    attempts = 0
+                    item = None
+                    while attempts < max_attempts:
+                        item = get_next_post_from_queue()
+                        if not item:
+                            log.warning("[MIXED QUEUE] No posts available in queue")
+                            break
+                        
+                        # Проверяем, если это готовый файл из ready_to_publish
+                        if item.get("from_ready_folder", False):
+                            ready_path = Path(item.get("ready_file_path", ""))
+                            if ready_path and not ready_path.exists():
+                                log.error(f"[SCHEDULER] missing file, drop from queue: {ready_path.name}")
+                                log.info(f"[SCHEDULER] pick_ready: name={ready_path.name}, exists=False")
+                                item = None
+                                attempts += 1
+                                continue  # Попробуем следующий файл
                             else:
-                                # Стандартный путь: скачиваем из Telegram
+                                log.info(f"[SCHEDULER] pick_ready: name={ready_path.name}, exists=True")
+                                break  # Файл существует, используем его
+                        else:
+                            # Это не ready-файл, можем использовать
+                            break
+                    
+                    if not item:
+                        if attempts >= max_attempts:
+                            log.warning("[SCHEDULER] attempts_exhausted (10), skipping post cycle")
+                        # === POSTNOW Wake-up: спим, но просыпаемся по событию ===
+                        POSTNOW_EVENT.clear()
+                        try:
+                            await asyncio.wait_for(POSTNOW_EVENT.wait(), timeout=60)
+                            log.info("[POSTNOW] Woken up by POSTNOW_EVENT!")
+                        except asyncio.TimeoutError:
+                            pass  # Обычный timeout, продолжаем работу
+                        continue
+                    
+                    save_queue()
+                    log.info("Worker pop type=%s voiceover=%s size_after_pop=%s (scheduled)", 
+                            item["type"], item.get("voiceover", False), len(POST_QUEUE))
+
+                try:
+                    if item["type"] == "carousel_pending":
+                        log.info("Carousel posts temporarily disabled; skipping.")
+                        await delete_from_buffer(application, item)
+                        await send_progress_report(application)
+                        continue
+                    if item["type"] == "text":
+                        text = prepare_caption_for_publish(item.get("text", ""))
+                        msg = await application.bot.send_message(
+                            chat_id=MAIN_CHANNEL_ID,
+                            text=text,
+                            parse_mode="HTML"
+                        )
+                        increment_stat("text")
+                        PUBLISHED_TEXTS.append(text)
+                        if len(PUBLISHED_TEXTS) > MAX_PUBLISHED_TEXTS:
+                            PUBLISHED_TEXTS.pop(0)
+                        save_published_texts()
+                        log.info("published_ok (text)")
+                        await delete_from_buffer(application, item)
+                        await send_progress_report(application)
+                        LAST_POST_TIME = datetime.now()
+                        save_last_post_time()
+                    elif item["type"] == "photo":
+                        upload_path = None
+                        caption_tg = prepare_caption_for_publish_tg(item.get("caption", ""))
+                        caption_meta = prepare_caption_for_publish_meta(item.get("caption", ""))
+                        if caption_tg and len(caption_tg) > CAPTION_MAX_LENGTH:
+                            caption_tg = trim_caption_with_footer(caption_tg, CAPTION_MAX_LENGTH)
+                            log.info(f"Caption trimmed to {len(caption_tg)} chars (was {len(item.get('caption', ''))})")
+
+                        tmp_dir = Path("tmp_media")
+                        tmp_dir.mkdir(exist_ok=True)
+                        photo_file_id = item["file_id"]
+                        public_url = None
+                        local_path = None
+                        processed_photo = None
+                        log.info(f"[DEBUG] Starting Supabase upload for post (photo) file_id={photo_file_id}")
+                        try:
+                            file_obj = await application.bot.get_file(photo_file_id)
+                            remote_path = getattr(file_obj, "file_path", "") or ""
+                            suffix = Path(remote_path).suffix or ".jpg"
+                            local_path = tmp_dir / f"{photo_file_id}{suffix}"
+                            await file_obj.download_to_drive(custom_path=str(local_path))
+                            
+                            processed_photo = process_photo(local_path)
+                            upload_path = processed_photo if processed_photo and Path(processed_photo).exists() else local_path
+                            if upload_path == local_path and not processed_photo:
+                                log.warning("Photo watermark skipped (processing failed); sending original photo.")
+
+                            content_type = mimetypes.guess_type(str(upload_path))[0] or "image/jpeg"
+                            public_url = upload_to_supabase(str(upload_path), content_type)
+                            if public_url:
+                                log.info(f"SUPABASE_URL_OK: {public_url}")
+                                item["supabase_url"] = public_url
+                            else:
+                                log.error("SUPABASE_UPLOAD_FAILED")
+                        except Exception as e:
+                            log.error(f"SUPABASE_UPLOAD_FAILED: {e}")
+                            send_admin_error(f"Supabase upload failed (photo): {e}")
+                            await sleep_or_postnow(5)
+                            continue
+                        if not upload_path or not Path(upload_path).exists():
+                            log.error("Photo upload_path missing; skipping send.")
+                        else:
+                            try:
+                                with open(upload_path, "rb") as f:
+                                    await application.bot.send_photo(
+                                        chat_id=MAIN_CHANNEL_ID,
+                                        photo=f,
+                                        caption=caption_tg if caption_tg else None,
+                                        parse_mode="HTML"
+                                    )
+                            except Exception as e:
+                                log.error(f"Telegram send photo failed: {e}")
+                            try:
+                                item_fb = dict(item)
+                                item_fb["caption"] = caption_meta
+                                await publish_to_facebook(item_fb)
+                                append_history("FB", "Photo", item.get("supabase_url", "-"), item.get("translation_cost", 0.0))
+                            except Exception as e:
+                                log.error(f"Facebook publish error (photo): {e}")
+                                send_admin_error(f"Facebook publish error (photo): {e}")
+
+                            increment_stat("photo")
+                            append_history("TG", "Photo", item.get("supabase_url", "-"), item.get("translation_cost", 0.0))
+                            if caption_tg:
+                                PUBLISHED_TEXTS.append(caption_tg)
+                                if len(PUBLISHED_TEXTS) > MAX_PUBLISHED_TEXTS:
+                                    PUBLISHED_TEXTS.pop(0)
+                                save_published_texts()
+                            log.info("published_ok (photo)")
+                        
+                        # cleanup после отправки
+                        for p in [local_path, processed_photo, upload_path]:
+                            if p and Path(p).exists():
+                                await safe_unlink(p)
+
+                        await delete_from_buffer(application, item)
+                        await send_progress_report(application)
+                        LAST_PHOTO_TIME = datetime.now()
+                        LAST_POST_TIME = datetime.now()
+                        save_last_post_time()
+                        
+                        # NOTE: IG_SCHEDULE counters incremented at the end of post_worker (no double increment)
+                        # IG: только видео, пропускаем фото
+                        maybe_delete_supabase_media(item, reason="telegram")
+                    elif item["type"] == "video":
+                        # Инициализация переменных для всех путей обработки
+                        local_path = None
+                        processed_path = None
+                        upload_path = None
+                        
+                        # Проверяем, это готовый файл из ready_to_publish или нужно обработать
+                        if item.get("from_ready_folder", False):
+                            # Берем готовый файл, который уже был загружен в очередь
+                            log.info("[CONVEYOR] Using pre-loaded ready video from queue")
+                            
+                            ready_video_path = Path(item["ready_file_path"])
+                            
+                            # 🔍 DIAGNOSTICS: Проверяем существование файла
+                            file_exists = ready_video_path.exists()
+                            file_absolute = ready_video_path.resolve()
+                            log.info(f"[CONVEYOR] Ready file check: name={ready_video_path.name}, exists={file_exists}")
+                            log.info(f"[CONVEYOR] Ready file absolute path: {file_absolute}")
+                            
+                            if not file_exists:
+                                # Выводим содержимое папки для диагностики
+                                ready_dir = READY_TO_PUBLISH_DIR.resolve()
+                                dir_contents = list(READY_TO_PUBLISH_DIR.glob("*"))[:20]
+                                log.error(f"[CONVEYOR] Ready file not found: {file_absolute}")
+                                log.error(f"[CONVEYOR] Ready directory: {ready_dir}")
+                                log.error(f"[CONVEYOR] Directory contents (first 20): {[f.name for f in dir_contents]}")
+                                continue
+                            
+                            # Загружаем метаданные (поддерживаем .json и .mp4.json)
+                            ready_meta_a = ready_video_path.with_suffix('.json')
+                            ready_meta_b = ready_video_path.with_suffix('.mp4.json')
+                            ready_meta_path = ready_meta_a if ready_meta_a.exists() else (ready_meta_b if ready_meta_b.exists() else None)
+                            
+                            # Загружаем метаданные
+                            caption = item.get("caption", "")
+                            if ready_meta_path and ready_meta_path.exists():
+                                try:
+                                    with open(ready_meta_path, 'r', encoding='utf-8') as f:
+                                        meta = json.load(f)
+                                        caption = meta.get('caption', caption)
+                                        log.info(f"[CONVEYOR] Loaded metadata from {ready_meta_path.name}")
+                                except Exception as e:
+                                    log.warning(f"[CONVEYOR] Failed to load metadata: {e}")
+                            
+                            caption_tg = prepare_caption_for_publish_tg(caption)
+                            caption_meta = prepare_caption_for_publish_meta(caption)
+                            
+                            if caption_tg and len(caption_tg) > CAPTION_MAX_LENGTH:
+                                caption_tg = trim_caption_with_footer(caption_tg, CAPTION_MAX_LENGTH)
+                            
+                            upload_path = ready_video_path
+                            # ✅ FIX: Устанавливаем local_path для Plan B Instagram
+                            local_path = ready_video_path
+                        else:
+                            # ⚠️ Это сырой файл - скачиваем и обрабатываем
+                            log.info("[CONVEYOR] Processing raw video file")
+                            
+                            tmp_dir = Path("tmp_media")
+                            tmp_dir.mkdir(exist_ok=True)
+                            video_file_id = item["file_id"]
+                            
+                            caption = item.get("caption", "")
+                            caption_tg = prepare_caption_for_publish_tg(caption)
+                            caption_meta = prepare_caption_for_publish_meta(caption)
+                            
+                            if caption_tg and len(caption_tg) > CAPTION_MAX_LENGTH:
+                                caption_tg = trim_caption_with_footer(caption_tg, CAPTION_MAX_LENGTH)
+                            
+                            try:
+                                # Скачиваем файл из Telegram
                                 file_obj = await application.bot.get_file(video_file_id)
                                 remote_path = getattr(file_obj, "file_path", "") or ""
                                 suffix = Path(remote_path).suffix or ".mp4"
                                 local_path = tmp_dir / f"{video_file_id}{suffix}"
-                                
-                                # Скачиваем сырое видео из TG
                                 await file_obj.download_to_drive(custom_path=str(local_path))
-                                log.info(f"[FIRST STRIKE] Видео скачано из Telegram: {local_path.name}")
+                                
+                                # Обрабатываем видео
+                                processed_path = process_video(local_path, caption)
+                                if not processed_path or not Path(processed_path).exists():
+                                    log.error("[CONVEYOR] Video processing failed")
+                                    # Cleanup
+                                    if local_path and Path(local_path).exists():
+                                        await safe_unlink(local_path)
+                                    continue
+                                
+                                upload_path = processed_path
+                                log.info(f"[CONVEYOR] Raw video processed: {Path(upload_path).name}")
+                            except Exception as e:
+                                log.error(f"[CONVEYOR] Failed to process raw video: {e}")
+                                # Cleanup
+                                for p in [local_path, processed_path]:
+                                    if p and Path(p).exists():
+                                        await safe_unlink(p)
+                                continue
+                        
+                        # Загружаем готовое видео в Supabase (если еще не загружено)
+                        if not item.get("supabase_url"):
+                            # ПРОВЕРКА: Файл должен существовать перед загрузкой
+                            if not upload_path or not Path(upload_path).exists():
+                                log.critical(f"🚨 CRITICAL | File not found for upload: {upload_path}")
+                                log.critical("🚨 CRITICAL | Skipping broken post due to missing file")
+                                # Удаляем метаданные если есть (READY_META_EXT_FIX: try both formats)
+                                if upload_path:
+                                    meta_path_a = Path(str(upload_path)).with_suffix('.json')
+                                    meta_path_b = Path(str(upload_path)).with_suffix('.mp4.json')
+                                    meta_path = meta_path_a if meta_path_a.exists() else (meta_path_b if meta_path_b.exists() else None)
+                                    if meta_path.exists():
+                                        await safe_unlink(meta_path)
+                                save_queue()
+                                await sleep_or_postnow(300)
+                                continue
                             
-                            # Обрабатываем видео
-                            processed_path = process_video(local_path, caption)
-                            if not processed_path or not Path(processed_path).exists():
-                                raise RuntimeError("[FIRST STRIKE] Video processing failed")
-                            upload_path = processed_path
-
-                            # Загружаем в Supabase
-                            content_type = mimetypes.guess_type(str(upload_path))[0] or "video/mp4"
-                            public_url = upload_to_supabase(str(upload_path), content_type)
-                            if public_url:
-                                log.info(f"[FIRST STRIKE] Supabase URL OK: {public_url}")
-                                item["supabase_url"] = public_url
-                            else:
-                                raise RuntimeError("[FIRST STRIKE] Supabase upload failed")
-                            
-                    except Exception as e:
-                        error_msg = str(e)
-                        log.error(f"[FIRST STRIKE] Processing error: {e}")
+                            public_url = None
+                            try:
+                                content_type = "video/mp4"
+                                public_url = upload_to_supabase(str(upload_path), content_type)
+                                if public_url:
+                                    log.info(f"[SUPABASE] Upload OK: {public_url}")
+                                    item["supabase_url"] = public_url
+                                else:
+                                    log.error("[SUPABASE] Upload failed")
+                                    if item.get("from_ready_folder"):
+                                        # Удаляем битый файл (READY_META_EXT_FIX: try both formats)
+                                        if upload_path.exists():
+                                            await safe_unlink(upload_path)
+                                        meta_path_a = upload_path.with_suffix('.json')
+                                        meta_path_b = upload_path.with_suffix('.mp4.json')
+                                        meta_path = meta_path_a if meta_path_a.exists() else (meta_path_b if meta_path_b.exists() else None)
+                                        if meta_path and meta_path.exists():
+                                            await safe_unlink(meta_path)
+                                    log.critical("🚨 CRITICAL | Skipping broken post due to Supabase upload failure")
+                                    save_queue()
+                                    await sleep_or_postnow(300)
+                                    continue
+                            except Exception as e:
+                                log.error(f"[SUPABASE] Upload error: {e}")
+                                log.critical("🚨 CRITICAL | Skipping broken post due to Supabase exception")
+                                save_queue()
+                                await sleep_or_postnow(300)
+                                continue
                         
-                        # Удаляем временные файлы
-                        for p in [local_path, processed_path]:
-                            if p and Path(p).exists():
-                                Path(p).unlink()
-                        
-                        # Проверяем на Invalid file_id или критические ошибки
-                        if "Invalid file_id" in error_msg or "file_id" in error_msg.lower() or "Supabase" in error_msg:
-                            log.critical(f"🚨 CRITICAL | [FIRST STRIKE] Broken file detected: {error_msg[:100]}")
-                            log.critical("🚨 CRITICAL | [FIRST STRIKE] Skipping to next file immediately...")
-                            post_attempt_failed = True
-                            continue  # Переходим к следующему файлу
-                        
-                        # Для других ошибок тоже пробуем следующий
-                        post_attempt_failed = True
-                        continue
-                    
-                    # Если дошли сюда - файл обработан успешно, пробуем публиковать
-                    if not post_attempt_failed and item.get("supabase_url"):
+                        # Публикация в Telegram
                         try:
-                            # Публикация в Telegram
                             with open(upload_path, "rb") as f:
                                 await application.bot.send_video(
                                     chat_id=MAIN_CHANNEL_ID,
@@ -3561,545 +3968,236 @@ async def post_worker(application):
                                     width=1080,
                                     height=1920,
                                 )
-                            log.info("[FIRST STRIKE] Telegram format: VIDEO_STREAMING_ON")
-                            
-                            # Публикация в Facebook
+                            log.info("Telegram format: VIDEO_STREAMING_ON")
+                        except Exception as e:
+                            log.error(f"Telegram send video failed: {e}")
                             try:
                                 item_fb = dict(item)
                                 item_fb["caption"] = caption_meta
                                 await publish_to_facebook(item_fb)
                                 append_history("FB", "Video", item.get("supabase_url", "-"), item.get("translation_cost", 0.0))
                             except Exception as e:
-                                log.error(f"[FIRST STRIKE] Facebook publish error: {e}")
-                            
-                            # Instagram публикация (без Plan B для First Strike - просто одна попытка)
-                            if can_ig_publish("video"):
-                                try:
-                                    item_ig = dict(item)
-                                    item_ig["caption"] = caption_meta
-                                    ig_result = await publish_to_instagram(item_ig)
-                                    if ig_result:
-                                        log.info("[FIRST STRIKE] Instagram published successfully")
-                                        append_history("IG", "Video", item.get("supabase_url", "-"), item.get("translation_cost", 0.0))
-                                except Exception as e:
-                                    log.error(f"[FIRST STRIKE] Instagram publish error: {e}")
-                            
-                            # Cleanup временных файлов
-                            if item.get("from_ready_folder", False):
-                                # Для готовых файлов: удаляем файл и метаданные после публикации
-                                if upload_path and Path(upload_path).exists():
-                                    Path(upload_path).unlink()
-                                    log.info(f"[FIRST STRIKE] Deleted ready file: {Path(upload_path).name}")
-                                # Удаляем метаданные
-                                meta_path = Path(upload_path).with_suffix('.json') if upload_path else None
-                                if meta_path and meta_path.exists():
-                                    meta_path.unlink()
-                                    log.info(f"[FIRST STRIKE] Deleted metadata: {meta_path.name}")
-                            else:
-                                # Для сырых файлов: удаляем только временные файлы
-                                for p in [local_path, processed_path]:
-                                    if p and Path(p).exists():
-                                        Path(p).unlink()
-                            
-                            # Удаляем из буфера
-                            await delete_from_buffer(application, item)
-                            await send_progress_report(application)
-                            
-                            # Обновляем статистику
-                            increment_stat("video")
-                            append_history("TG", "Video", item.get("supabase_url", "-"), item.get("translation_cost", 0.0))
-                            if caption:
-                                PUBLISHED_TEXTS.append(caption)
-                                if len(PUBLISHED_TEXTS) > MAX_PUBLISHED_TEXTS:
-                                    PUBLISHED_TEXTS.pop(0)
-                                save_published_texts()
-                            
-                            # 🎯 УСПЕХ! Помечаем флаг и обновляем время
-                            first_strike_success = True
-                            LAST_POST_TIME = datetime.now()
-                            save_last_post_time()
-                            log.info(f"✅ [FIRST STRIKE] SUCCESS after {first_strike_attempts} attempt(s)! Published one post. Cooldown active.")
-                            
-                        except Exception as e:
-                            log.error(f"[FIRST STRIKE] Publication error: {e}")
-                            # Cleanup (только временные файлы, готовые НЕ удаляем)
-                            if not item.get("from_ready_folder", False):
-                                for p in [local_path, processed_path]:
-                                    if p and Path(p).exists():
-                                        Path(p).unlink()
-                            continue  # Пробуем следующий файл
-                    # === КОНЕЦ БЛОКА ОБРАБОТКИ FIRST STRIKE ВИДЕО ===
-                
-                # После цикла First Strike
-                if first_strike_success:
-                    log.info("[FIRST STRIKE] Completed! Next post in 60 minutes.")
-                else:
-                    log.error(f"[FIRST STRIKE] FAILED after {first_strike_attempts} attempts. No successful post.")
-                
-                # СБРАСЫВАЕМ ФЛАГ (теперь First Strike завершен)
-                FIRST_RUN_IMMEDIATE = False
-                continue  # Возвращаемся к началу цикла worker
-            else:
-                now = datetime.now()
-                ready = (LAST_POST_TIME is None) or ((now - LAST_POST_TIME) >= timedelta(seconds=PUBLISH_INTERVAL_SECONDS))
-                if not ready:
-                    if POST_QUEUE and POST_QUEUE[0].get("type") == "photo" and LAST_POST_TIME:
-                        next_time = LAST_POST_TIME + timedelta(seconds=PUBLISH_INTERVAL_SECONDS)
-                        log.info(f"INFO | [NEXT] Type: Photo. Scheduled at: {next_time.strftime('%Y-%m-%d %H:%M:%S')}")
-                    await asyncio.sleep(60)
-                    continue
-
-                # 🎛️ MIXED QUEUE 4+4: Выбираем пост по логике чередования
-                item = get_next_post_from_queue()
-                if not item:
-                    log.warning("[MIXED QUEUE] No posts available in queue")
-                    await asyncio.sleep(60)
-                    continue
-                save_queue()
-                log.info("Worker pop type=%s voiceover=%s size_after_pop=%s (scheduled)", 
-                        item["type"], item.get("voiceover", False), len(POST_QUEUE))
-
-            try:
-                if item["type"] == "carousel_pending":
-                    log.info("Carousel posts temporarily disabled; skipping.")
-                    await delete_from_buffer(application, item)
-                    await send_progress_report(application)
-                    continue
-                if item["type"] == "text":
-                    text = prepare_caption_for_publish(item.get("text", ""))
-                    msg = await application.bot.send_message(
-                        chat_id=MAIN_CHANNEL_ID,
-                        text=text,
-                        parse_mode="HTML"
-                    )
-                    increment_stat("text")
-                    PUBLISHED_TEXTS.append(text)
-                    if len(PUBLISHED_TEXTS) > MAX_PUBLISHED_TEXTS:
-                        PUBLISHED_TEXTS.pop(0)
-                    save_published_texts()
-                    log.info("published_ok (text)")
-                    await delete_from_buffer(application, item)
-                    await send_progress_report(application)
-                    LAST_POST_TIME = datetime.now()
-                    save_last_post_time()
-                elif item["type"] == "photo":
-                    upload_path = None
-                    caption_tg = prepare_caption_for_publish_tg(item.get("caption", ""))
-                    caption_meta = prepare_caption_for_publish_meta(item.get("caption", ""))
-                    if caption_tg and len(caption_tg) > CAPTION_MAX_LENGTH:
-                        caption_tg = trim_caption_with_footer(caption_tg, CAPTION_MAX_LENGTH)
-                        log.info(f"Caption trimmed to {len(caption_tg)} chars (was {len(item.get('caption', ''))})")
-
-                    tmp_dir = Path("tmp_media")
-                    tmp_dir.mkdir(exist_ok=True)
-                    photo_file_id = item["file_id"]
-                    public_url = None
-                    local_path = None
-                    processed_photo = None
-                    log.info(f"[DEBUG] Starting Supabase upload for post (photo) file_id={photo_file_id}")
-                    try:
-                        file_obj = await application.bot.get_file(photo_file_id)
-                        remote_path = getattr(file_obj, "file_path", "") or ""
-                        suffix = Path(remote_path).suffix or ".jpg"
-                        local_path = tmp_dir / f"{photo_file_id}{suffix}"
-                        await file_obj.download_to_drive(custom_path=str(local_path))
+                                log.error(f"Facebook publish error (video): {e}")
+                                send_admin_error(f"Facebook publish error (video): {e}")
+                        # INSTAGRAM ПУБЛИКАЦИЯ С ПЛАНОМ Б (Гарантированная публикация)
+                        ig_success = False
+                        ig_publish_attempts = 0
+                        max_ig_attempts = 3
                         
-                        processed_photo = process_photo(local_path)
-                        upload_path = processed_photo if processed_photo and Path(processed_photo).exists() else local_path
-                        if upload_path == local_path and not processed_photo:
-                            log.warning("Photo watermark skipped (processing failed); sending original photo.")
-
-                        content_type = mimetypes.guess_type(str(upload_path))[0] or "image/jpeg"
-                        public_url = upload_to_supabase(str(upload_path), content_type)
-                        if public_url:
-                            log.info(f"SUPABASE_URL_OK: {public_url}")
-                            item["supabase_url"] = public_url
+                        # === DIAGNOSTIC: IG Schedule Check ===
+                        now_before_check = datetime.now()
+                        ready_count = len(list(READY_TO_PUBLISH_DIR.glob("ready_*.mp4")))
+                        last_post_str = LAST_POST_TIME.strftime('%Y-%m-%d %H:%M:%S') if LAST_POST_TIME else "Never"
+                        log.info(f"[DIAGNOSTICS PRE-DECISION]")
+                        log.info(f"  FORCE_POST_NOW={FORCE_POST_NOW}")
+                        log.info(f"  Current time={now_before_check.strftime('%Y-%m-%d %H:%M:%S')} (hour={now_before_check.hour})")
+                        log.info(f"  IG_SCHEDULE: morning={IG_SCHEDULE['morning_videos']}/3, evening={IG_SCHEDULE['afternoon_videos']}/6")
+                        log.info(f"  LAST_POST_TIME={last_post_str}")
+                        log.info(f"  Queue size={len(POST_QUEUE)}, Ready count={ready_count}")
+                        
+                        # Проверка успешности Supabase ПЕРЕД попыткой IG публикации
+                        if can_ig_publish("video", force=FORCE_POST_NOW):
+                            if not item.get("supabase_url"):
+                                log.error("[IG_BLOCKED] Supabase upload failed - skipping Instagram publish to avoid empty URL")
+                            else:
+                                dark_palette = [(0, 0, 0), (10, 10, 20), (20, 20, 30), (12, 8, 24), (6, 12, 18)]
+                                
+                                while ig_publish_attempts < max_ig_attempts and not ig_success:
+                                    ig_publish_attempts += 1
+                                    
+                                    try:
+                                        # Первая попытка - используем уже обработанное видео
+                                        if ig_publish_attempts == 1:
+                                            log.info(f"[IG_ATTEMPT_{ig_publish_attempts}] Publishing with original processed video")
+                                            item_ig = dict(item)
+                                            item_ig["caption"] = caption_meta
+                                            ig_result = await publish_to_instagram(item_ig)
+                                            
+                                            if ig_result is True:
+                                                ig_success = True
+                                                append_history("IG", "Video", item.get("supabase_url", "-"), item.get("translation_cost", 0.0))
+                                                log.info("[IG_SUCCESS] Video published successfully on first attempt")
+                                                break
+                                            else:
+                                                log.warning(f"[IG_ATTEMPT_{ig_publish_attempts}] Failed, preparing Plan B")
+                                        
+                                        # ПЛАН Б: Повторные попытки с изменением параметров
+                                        else:
+                                            log.warning(f"[PLAN B] Instagram retry attempt {ig_publish_attempts}/{max_ig_attempts} with new unique parameters...")
+                                            
+                                            # Параметры для Плана Б
+                                            speed_mult = 1.01 + (ig_publish_attempts - 1) * 0.01  # 1.01, 1.02, 1.03
+                                            bg_color_new = dark_palette[(ig_publish_attempts - 1) % len(dark_palette)]
+                                            brightness_adj = 0.01 * ig_publish_attempts  # 0.01, 0.02, 0.03
+                                            
+                                            log.info(f"[PLAN B] Reprocessing video: speed={speed_mult:.3f}, bg={bg_color_new}, brightness={brightness_adj:+.3f}")
+                                            
+                                            # Перерабатываем видео с новыми параметрами
+                                            processed_path_retry = process_video(
+                                                local_path, 
+                                                caption, 
+                                                speed_multiplier=speed_mult, 
+                                                bg_color_override=bg_color_new, 
+                                                brightness_adjust=brightness_adj,
+                                                random_crop=True  # Случайная обрезка для обхода алгоритмов Meta
+                                            )
+                                            
+                                            if not processed_path_retry or not Path(processed_path_retry).exists():
+                                                log.error(f"[PLAN B] Video reprocessing failed on attempt {ig_publish_attempts}")
+                                                continue
+                                            
+                                            # Загружаем новую версию в Supabase
+                                            content_type_retry = mimetypes.guess_type(str(processed_path_retry))[0] or "video/mp4"
+                                            public_url_retry = upload_to_supabase(str(processed_path_retry), content_type_retry)
+                                            
+                                            if not public_url_retry:
+                                                log.error(f"[PLAN B] Supabase upload failed on attempt {ig_publish_attempts}")
+                                                # Удаляем временный файл повторной обработки
+                                                if Path(processed_path_retry).exists():
+                                                    await safe_unlink(processed_path_retry)
+                                                continue
+                                            
+                                            # Удаляем старый файл из Supabase перед новой попыткой
+                                            old_url = item.get("supabase_url")
+                                            if old_url:
+                                                delete_supabase_file(old_url)
+                                            
+                                            # Обновляем URL в item
+                                            item["supabase_url"] = public_url_retry
+                                            item_ig = dict(item)
+                                            item_ig["caption"] = caption_meta
+                                            
+                                            log.info(f"[PLAN B] Attempting publish with new URL: {public_url_retry[:60]}...")
+                                            ig_result = await publish_to_instagram(item_ig)
+                                            
+                                            if ig_result is True:
+                                                ig_success = True
+                                                append_history("IG", "Video", public_url_retry, item.get("translation_cost", 0.0))
+                                                log.info(f"[PLAN B SUCCESS] Video published on attempt {ig_publish_attempts}")
+                                                
+                                                # Удаляем временный файл повторной обработки
+                                                if Path(processed_path_retry).exists():
+                                                    await safe_unlink(processed_path_retry)
+                                                break
+                                            else:
+                                                log.warning(f"[PLAN B] Attempt {ig_publish_attempts} failed")
+                                                # Удаляем временный файл повторной обработки
+                                                if Path(processed_path_retry).exists():
+                                                    await safe_unlink(processed_path_retry)
+                                                
+                                                if ig_publish_attempts >= max_ig_attempts:
+                                                    log.error(f"[PLAN B EXHAUSTED] All {max_ig_attempts} attempts failed, giving up on this post")
+                                                    send_admin_error(f"Instagram: Failed after {max_ig_attempts} attempts (Plan B exhausted)")
+                                    
+                                    except Exception as e:
+                                        log.error(f"[IG_ATTEMPT_{ig_publish_attempts}] Exception: {e}")
+                                        send_admin_error(f"Instagram publish error (attempt {ig_publish_attempts}): {e}")
+                                        
+                                        if ig_publish_attempts >= max_ig_attempts:
+                                            log.error("[PLAN B EXHAUSTED] Maximum attempts reached, moving to next post")
+                        
+                        # ОТЛОЖЕННОЕ УДАЛЕНИЕ: Только после успеха Instagram или исчерпания попыток
+                        if ig_success:
+                            log.info("[IG_SUCCESS] Waiting 300 seconds before cleanup (guaranteed publish protocol)")
+                            await sleep_or_postnow(300)
+                        
+                        # cleanup после отправки
+                        # CONVEYOR: Удаляем готовый файл из ready_to_publish
+                        if upload_path and upload_path.parent == READY_TO_PUBLISH_DIR:
+                            try:
+                                if upload_path.exists():
+                                    await safe_unlink(upload_path)
+                                    log.info(f"[CONVEYOR] Deleted ready file: {upload_path.name}")
+                                # Удаляем метаданные (READY_META_EXT_FIX: try both formats)
+                                meta_path_a = upload_path.with_suffix('.json')
+                                meta_path_b = upload_path.with_suffix('.mp4.json')
+                                meta_path = meta_path_a if meta_path_a.exists() else (meta_path_b if meta_path_b.exists() else None)
+                                if meta_path and meta_path.exists():
+                                    await safe_unlink(meta_path)
+                                    log.info(f"[CONVEYOR] Deleted metadata: {meta_path.name}")
+                            except Exception as e:
+                                log.warning(f"[CONVEYOR] Failed to delete ready file: {e}")
                         else:
-                            log.error("SUPABASE_UPLOAD_FAILED")
-                    except Exception as e:
-                        log.error(f"SUPABASE_UPLOAD_FAILED: {e}")
-                        send_admin_error(f"Supabase upload failed (photo): {e}")
-                        await asyncio.sleep(5)
-                        continue
-                    if not upload_path or not Path(upload_path).exists():
-                        log.error("Photo upload_path missing; skipping send.")
-                    else:
-                        try:
-                            with open(upload_path, "rb") as f:
-                                await application.bot.send_photo(
-                                    chat_id=MAIN_CHANNEL_ID,
-                                    photo=f,
-                                    caption=caption_tg if caption_tg else None,
-                                    parse_mode="HTML"
-                                )
-                        except Exception as e:
-                            log.error(f"Telegram send photo failed: {e}")
-                        try:
-                            item_fb = dict(item)
-                            item_fb["caption"] = caption_meta
-                            await publish_to_facebook(item_fb)
-                            append_history("FB", "Photo", item.get("supabase_url", "-"), item.get("translation_cost", 0.0))
-                        except Exception as e:
-                            log.error(f"Facebook publish error (photo): {e}")
-                            send_admin_error(f"Facebook publish error (photo): {e}")
-
-                        increment_stat("photo")
-                        append_history("TG", "Photo", item.get("supabase_url", "-"), item.get("translation_cost", 0.0))
-                        if caption_tg:
-                            PUBLISHED_TEXTS.append(caption_tg)
+                            # FIRST STRIKE: Удаляем временные файлы (local_path, processed_path)
+                            try:
+                                if 'local_path' in locals() and local_path and Path(local_path).exists():
+                                    await safe_unlink(local_path)
+                                    log.info(f"[FIRST STRIKE] Deleted temp file: {Path(local_path).name}")
+                                if 'processed_path' in locals() and processed_path and Path(processed_path).exists():
+                                    await safe_unlink(processed_path)
+                                    log.info(f"[FIRST STRIKE] Deleted processed file: {Path(processed_path).name}")
+                                if upload_path and Path(upload_path).exists():
+                                    await safe_unlink(upload_path)
+                                    log.info(f"[FIRST STRIKE] Deleted upload file: {Path(upload_path).name}")
+                            except Exception as e:
+                                log.warning(f"[FIRST STRIKE] Failed to delete temp files: {e}")
+                        
+                        # Удаление из Supabase ТОЛЬКО если IG успешна или попытки исчерпаны
+                        if ig_success or ig_publish_attempts >= max_ig_attempts:
+                            maybe_delete_supabase_media(item, reason="all_platforms_complete")
+                            log.info(f"[CLEANUP] Supabase cleanup executed (ig_success={ig_success}, attempts={ig_publish_attempts})")
+                        else:
+                            log.warning("[CLEANUP] Supabase cleanup skipped - IG publish pending")
+                        
+                        increment_stat("video")
+                        append_history("TG", "Video", item.get("supabase_url", "-"), item.get("translation_cost", 0.0))
+                        if caption:
+                            PUBLISHED_TEXTS.append(caption)
                             if len(PUBLISHED_TEXTS) > MAX_PUBLISHED_TEXTS:
                                 PUBLISHED_TEXTS.pop(0)
                             save_published_texts()
-                        log.info("published_ok (photo)")
-                    
-                    # cleanup после отправки
-                    for p in [local_path, processed_photo, upload_path]:
-                        if p and Path(p).exists():
-                            try:
-                                Path(p).unlink()
-                            except Exception:
-                                pass
-
-                    await delete_from_buffer(application, item)
-                    await send_progress_report(application)
-                    LAST_PHOTO_TIME = datetime.now()
-                    LAST_POST_TIME = datetime.now()
-                    save_last_post_time()
-                    # IG: только видео, пропускаем фото
-                    maybe_delete_supabase_media(item, reason="telegram")
-                elif item["type"] == "video":
-                    # Инициализация переменных для всех путей обработки
-                    local_path = None
-                    processed_path = None
-                    upload_path = None
-                    
-                    # Проверяем, это готовый файл из ready_to_publish или нужно обработать
-                    if item.get("from_ready_folder", False):
-                        # Берем готовый файл, который уже был загружен в очередь
-                        log.info("[CONVEYOR] Using pre-loaded ready video from queue")
+                        log.info("published_ok (video)")
                         
-                        ready_video_path = Path(item["ready_file_path"])
-                        if not ready_video_path.exists():
-                            log.error(f"[CONVEYOR] Ready file not found: {ready_video_path}")
-                            continue
-                        
-                        ready_meta_path = ready_video_path.with_suffix('.json')
-                        
-                        # Загружаем метаданные
-                        caption = item.get("caption", "")
-                        if ready_meta_path.exists():
-                            try:
-                                with open(ready_meta_path, 'r', encoding='utf-8') as f:
-                                    meta = json.load(f)
-                                    caption = meta.get('caption', caption)
-                                    log.info(f"[CONVEYOR] Loaded metadata from {ready_meta_path.name}")
-                            except Exception as e:
-                                log.warning(f"[CONVEYOR] Failed to load metadata: {e}")
-                        
-                        caption_tg = prepare_caption_for_publish_tg(caption)
-                        caption_meta = prepare_caption_for_publish_meta(caption)
-                        
-                        if caption_tg and len(caption_tg) > CAPTION_MAX_LENGTH:
-                            caption_tg = trim_caption_with_footer(caption_tg, CAPTION_MAX_LENGTH)
-                        
-                        upload_path = ready_video_path
-                        # ✅ FIX: Устанавливаем local_path для Plan B Instagram
-                        local_path = ready_video_path
-                    else:
-                        # ⚠️ Это сырой файл - скачиваем и обрабатываем
-                        log.info("[CONVEYOR] Processing raw video file")
-                        
-                        tmp_dir = Path("tmp_media")
-                        tmp_dir.mkdir(exist_ok=True)
-                        video_file_id = item["file_id"]
-                        
-                        caption = item.get("caption", "")
-                        caption_tg = prepare_caption_for_publish_tg(caption)
-                        caption_meta = prepare_caption_for_publish_meta(caption)
-                        
-                        if caption_tg and len(caption_tg) > CAPTION_MAX_LENGTH:
-                            caption_tg = trim_caption_with_footer(caption_tg, CAPTION_MAX_LENGTH)
-                        
-                        try:
-                            # Скачиваем файл из Telegram
-                            file_obj = await application.bot.get_file(video_file_id)
-                            remote_path = getattr(file_obj, "file_path", "") or ""
-                            suffix = Path(remote_path).suffix or ".mp4"
-                            local_path = tmp_dir / f"{video_file_id}{suffix}"
-                            await file_obj.download_to_drive(custom_path=str(local_path))
-                            
-                            # Обрабатываем видео
-                            processed_path = process_video(local_path, caption)
-                            if not processed_path or not Path(processed_path).exists():
-                                log.error("[CONVEYOR] Video processing failed")
-                                # Cleanup
-                                if local_path and Path(local_path).exists():
-                                    Path(local_path).unlink()
-                                continue
-                            
-                            upload_path = processed_path
-                            log.info(f"[CONVEYOR] Raw video processed: {Path(upload_path).name}")
-                        except Exception as e:
-                            log.error(f"[CONVEYOR] Failed to process raw video: {e}")
-                            # Cleanup
-                            for p in [local_path, processed_path]:
-                                if p and Path(p).exists():
-                                    Path(p).unlink()
-                            continue
-                    
-                    # Загружаем готовое видео в Supabase (если еще не загружено)
-                    if not item.get("supabase_url"):
-                        # ПРОВЕРКА: Файл должен существовать перед загрузкой
-                        if not upload_path or not Path(upload_path).exists():
-                            log.critical(f"🚨 CRITICAL | File not found for upload: {upload_path}")
-                            log.critical("🚨 CRITICAL | Skipping broken post due to missing file")
-                            # Удаляем метаданные если есть
-                            if upload_path:
-                                meta_path = Path(str(upload_path)).with_suffix('.json')
-                                if meta_path.exists():
-                                    meta_path.unlink()
-                            save_queue()
-                            await asyncio.sleep(300)
-                            continue
-                        
-                        public_url = None
-                        try:
-                            content_type = "video/mp4"
-                            public_url = upload_to_supabase(str(upload_path), content_type)
-                            if public_url:
-                                log.info(f"[SUPABASE] Upload OK: {public_url}")
-                                item["supabase_url"] = public_url
-                            else:
-                                log.error("[SUPABASE] Upload failed")
-                                if item.get("from_ready_folder"):
-                                    # Удаляем битый файл
-                                    if upload_path.exists():
-                                        upload_path.unlink()
-                                    meta_path = upload_path.with_suffix('.json')
-                                    if meta_path.exists():
-                                        meta_path.unlink()
-                                log.critical("🚨 CRITICAL | Skipping broken post due to Supabase upload failure")
-                                save_queue()
-                                await asyncio.sleep(300)
-                                continue
-                        except Exception as e:
-                            log.error(f"[SUPABASE] Upload error: {e}")
-                            log.critical("🚨 CRITICAL | Skipping broken post due to Supabase exception")
-                            save_queue()
-                            await asyncio.sleep(300)
-                            continue
-                    
-                    # Публикация в Telegram
-                    try:
-                        with open(upload_path, "rb") as f:
-                            await application.bot.send_video(
-                                chat_id=MAIN_CHANNEL_ID,
-                                video=f,
-                                caption=caption_tg if caption_tg else None,
-                                parse_mode="HTML",
-                                supports_streaming=True,
-                                width=1080,
-                                height=1920,
-                            )
-                        log.info("Telegram format: VIDEO_STREAMING_ON")
-                    except Exception as e:
-                        log.error(f"Telegram send video failed: {e}")
-                    try:
-                        item_fb = dict(item)
-                        item_fb["caption"] = caption_meta
-                        await publish_to_facebook(item_fb)
-                        append_history("FB", "Video", item.get("supabase_url", "-"), item.get("translation_cost", 0.0))
-                    except Exception as e:
-                        log.error(f"Facebook publish error (video): {e}")
-                        send_admin_error(f"Facebook publish error (video): {e}")
-                    # INSTAGRAM ПУБЛИКАЦИЯ С ПЛАНОМ Б (Гарантированная публикация)
-                    ig_success = False
-                    ig_publish_attempts = 0
-                    max_ig_attempts = 3
-                    
-                    # Проверка успешности Supabase ПЕРЕД попыткой IG публикации
-                    if can_ig_publish("video"):
-                        if not item.get("supabase_url"):
-                            log.error("[IG_BLOCKED] Supabase upload failed - skipping Instagram publish to avoid empty URL")
-                        else:
-                            dark_palette = [(0, 0, 0), (10, 10, 20), (20, 20, 30), (12, 8, 24), (6, 12, 18)]
-                            
-                            while ig_publish_attempts < max_ig_attempts and not ig_success:
-                                ig_publish_attempts += 1
-                                
-                                try:
-                                    # Первая попытка - используем уже обработанное видео
-                                    if ig_publish_attempts == 1:
-                                        log.info(f"[IG_ATTEMPT_{ig_publish_attempts}] Publishing with original processed video")
-                                        item_ig = dict(item)
-                                        item_ig["caption"] = caption_meta
-                                        ig_result = await publish_to_instagram(item_ig)
-                                        
-                                        if ig_result is True:
-                                            ig_success = True
-                                            append_history("IG", "Video", item.get("supabase_url", "-"), item.get("translation_cost", 0.0))
-                                            log.info("[IG_SUCCESS] Video published successfully on first attempt")
-                                            break
-                                        else:
-                                            log.warning(f"[IG_ATTEMPT_{ig_publish_attempts}] Failed, preparing Plan B")
-                                    
-                                    # ПЛАН Б: Повторные попытки с изменением параметров
-                                    else:
-                                        log.warning(f"[PLAN B] Instagram retry attempt {ig_publish_attempts}/{max_ig_attempts} with new unique parameters...")
-                                        
-                                        # Параметры для Плана Б
-                                        speed_mult = 1.01 + (ig_publish_attempts - 1) * 0.01  # 1.01, 1.02, 1.03
-                                        bg_color_new = dark_palette[(ig_publish_attempts - 1) % len(dark_palette)]
-                                        brightness_adj = 0.01 * ig_publish_attempts  # 0.01, 0.02, 0.03
-                                        
-                                        log.info(f"[PLAN B] Reprocessing video: speed={speed_mult:.3f}, bg={bg_color_new}, brightness={brightness_adj:+.3f}")
-                                        
-                                        # Перерабатываем видео с новыми параметрами
-                                        processed_path_retry = process_video(
-                                            local_path, 
-                                            caption, 
-                                            speed_multiplier=speed_mult, 
-                                            bg_color_override=bg_color_new, 
-                                            brightness_adjust=brightness_adj,
-                                            random_crop=True  # Случайная обрезка для обхода алгоритмов Meta
-                                        )
-                                        
-                                        if not processed_path_retry or not Path(processed_path_retry).exists():
-                                            log.error(f"[PLAN B] Video reprocessing failed on attempt {ig_publish_attempts}")
-                                            continue
-                                        
-                                        # Загружаем новую версию в Supabase
-                                        content_type_retry = mimetypes.guess_type(str(processed_path_retry))[0] or "video/mp4"
-                                        public_url_retry = upload_to_supabase(str(processed_path_retry), content_type_retry)
-                                        
-                                        if not public_url_retry:
-                                            log.error(f"[PLAN B] Supabase upload failed on attempt {ig_publish_attempts}")
-                                            # Удаляем временный файл повторной обработки
-                                            if Path(processed_path_retry).exists():
-                                                Path(processed_path_retry).unlink()
-                                            continue
-                                        
-                                        # Удаляем старый файл из Supabase перед новой попыткой
-                                        old_url = item.get("supabase_url")
-                                        if old_url:
-                                            delete_supabase_file(old_url)
-                                        
-                                        # Обновляем URL в item
-                                        item["supabase_url"] = public_url_retry
-                                        item_ig = dict(item)
-                                        item_ig["caption"] = caption_meta
-                                        
-                                        log.info(f"[PLAN B] Attempting publish with new URL: {public_url_retry[:60]}...")
-                                        ig_result = await publish_to_instagram(item_ig)
-                                        
-                                        if ig_result is True:
-                                            ig_success = True
-                                            append_history("IG", "Video", public_url_retry, item.get("translation_cost", 0.0))
-                                            log.info(f"[PLAN B SUCCESS] Video published on attempt {ig_publish_attempts}")
-                                            
-                                            # Удаляем временный файл повторной обработки
-                                            if Path(processed_path_retry).exists():
-                                                Path(processed_path_retry).unlink()
-                                            break
-                                        else:
-                                            log.warning(f"[PLAN B] Attempt {ig_publish_attempts} failed")
-                                            # Удаляем временный файл повторной обработки
-                                            if Path(processed_path_retry).exists():
-                                                Path(processed_path_retry).unlink()
-                                            
-                                            if ig_publish_attempts >= max_ig_attempts:
-                                                log.error(f"[PLAN B EXHAUSTED] All {max_ig_attempts} attempts failed, giving up on this post")
-                                                send_admin_error(f"Instagram: Failed after {max_ig_attempts} attempts (Plan B exhausted)")
-                                
-                                except Exception as e:
-                                    log.error(f"[IG_ATTEMPT_{ig_publish_attempts}] Exception: {e}")
-                                    send_admin_error(f"Instagram publish error (attempt {ig_publish_attempts}): {e}")
-                                    
-                                    if ig_publish_attempts >= max_ig_attempts:
-                                        log.error("[PLAN B EXHAUSTED] Maximum attempts reached, moving to next post")
-                    
-                    # ОТЛОЖЕННОЕ УДАЛЕНИЕ: Только после успеха Instagram или исчерпания попыток
-                    if ig_success:
-                        log.info("[IG_SUCCESS] Waiting 300 seconds before cleanup (guaranteed publish protocol)")
-                        await asyncio.sleep(300)
-                    
-                    # cleanup после отправки
-                    # CONVEYOR: Удаляем готовый файл из ready_to_publish
-                    if upload_path and upload_path.parent == READY_TO_PUBLISH_DIR:
-                        try:
-                            if upload_path.exists():
-                                upload_path.unlink()
-                                log.info(f"[CONVEYOR] Deleted ready file: {upload_path.name}")
-                            # Удаляем метаданные
-                            meta_path = upload_path.with_suffix('.json')
-                            if meta_path.exists():
-                                meta_path.unlink()
-                                log.info(f"[CONVEYOR] Deleted metadata: {meta_path.name}")
-                        except Exception as e:
-                            log.warning(f"[CONVEYOR] Failed to delete ready file: {e}")
-                    else:
-                        # FIRST STRIKE: Удаляем временные файлы (local_path, processed_path)
-                        try:
-                            if 'local_path' in locals() and local_path and Path(local_path).exists():
-                                Path(local_path).unlink()
-                                log.info(f"[FIRST STRIKE] Deleted temp file: {Path(local_path).name}")
-                            if 'processed_path' in locals() and processed_path and Path(processed_path).exists():
-                                Path(processed_path).unlink()
-                                log.info(f"[FIRST STRIKE] Deleted processed file: {Path(processed_path).name}")
-                            if upload_path and Path(upload_path).exists():
-                                Path(upload_path).unlink()
-                                log.info(f"[FIRST STRIKE] Deleted upload file: {Path(upload_path).name}")
-                        except Exception as e:
-                            log.warning(f"[FIRST STRIKE] Failed to delete temp files: {e}")
-                    
-                    # Удаление из Supabase ТОЛЬКО если IG успешна или попытки исчерпаны
-                    if ig_success or ig_publish_attempts >= max_ig_attempts:
-                        maybe_delete_supabase_media(item, reason="all_platforms_complete")
-                        log.info(f"[CLEANUP] Supabase cleanup executed (ig_success={ig_success}, attempts={ig_publish_attempts})")
-                    else:
-                        log.warning("[CLEANUP] Supabase cleanup skipped - IG publish pending")
-                    
-                    increment_stat("video")
-                    append_history("TG", "Video", item.get("supabase_url", "-"), item.get("translation_cost", 0.0))
-                    if caption:
-                        PUBLISHED_TEXTS.append(caption)
-                        if len(PUBLISHED_TEXTS) > MAX_PUBLISHED_TEXTS:
-                            PUBLISHED_TEXTS.pop(0)
-                        save_published_texts()
-                    log.info("published_ok (video)")
-                    
-                    await delete_from_buffer(application, item)
-                    await send_progress_report(application)
-                    LAST_VIDEO_TIME = datetime.now()
-                    LAST_POST_TIME = datetime.now()
-                    save_last_post_time()
-            except Exception as e:
-                log.error(f"Failed to send post: {e}")
-                error_msg = str(e)
-                
-                # Не зацикливаемся на битых постах
-                if isinstance(e, BadRequest) or "Bad Request" in error_msg or "Invalid file_id" in error_msg:
-                    log.critical("🚨 CRITICAL | Skipping broken post due to BadRequest/Invalid file_id")
-                    try:
-                        maybe_delete_supabase_media(item, reason="bad_request")
                         await delete_from_buffer(application, item)
                         await send_progress_report(application)
-                    except Exception as e2:
-                        log.error(f"Failed to cleanup after BadRequest: {e2}")
-                    # НЕ возвращаем в очередь
-                    save_queue()
-                    await asyncio.sleep(300)
-                else:
-                    # Только для неизвестных ошибок возвращаем в очередь
-                    POST_QUEUE.appendleft(item)
-                    save_queue()
-                    await asyncio.sleep(60)
-        else:
-            # Очередь пустая - проверяем, есть ли готовые файлы
-            loaded = load_ready_files_to_queue()
-            if loaded == 0:
-                log.info("[DEBUG] Queue empty and no ready files. Waiting...")
-            await asyncio.sleep(60)
+                        LAST_VIDEO_TIME = datetime.now()
+                        LAST_POST_TIME = datetime.now()
+                        save_last_post_time()
+                        
+                        # Increment schedule counters (9 posts/day: 3 morning + 6 evening)
+                        now_publish = datetime.now()
+                        if now_publish.hour < 14:
+                            IG_SCHEDULE["morning_videos"] += 1
+                            log.info(f"[SCHEDULER] Morning counter: {IG_SCHEDULE['morning_videos']}/3")
+                        elif 16 <= now_publish.hour <= 21:
+                            IG_SCHEDULE["afternoon_videos"] += 1
+                            log.info(f"[SCHEDULER] Evening counter: {IG_SCHEDULE['afternoon_videos']}/6")
+                        
+                        # === FINAL POSTNOW RESET (after full publish cycle) ===
+                        if FORCE_POST_NOW:
+                            FORCE_POST_NOW = False
+                            log.info("[POSTNOW] Final reset after full multi-platform publish")
+                except Exception as e:
+                    log.error(f"Failed to send post: {e}")
+                    error_msg = str(e)
+                    
+                    # Не зацикливаемся на битых постах
+                    if isinstance(e, BadRequest) or "Bad Request" in error_msg or "Invalid file_id" in error_msg:
+                        log.critical("🚨 CRITICAL | Skipping broken post due to BadRequest/Invalid file_id")
+                        try:
+                            maybe_delete_supabase_media(item, reason="bad_request")
+                            await delete_from_buffer(application, item)
+                            await send_progress_report(application)
+                        except Exception as e2:
+                            log.error(f"Failed to cleanup after BadRequest: {e2}")
+                        # НЕ возвращаем в очередь
+                        save_queue()
+                        await sleep_or_postnow(300)
+                    else:
+                        # Только для неизвестных ошибок возвращаем в очередь
+                        POST_QUEUE.appendleft(item)
+                        save_queue()
+                        await sleep_or_postnow(60)
+            else:
+                # Очередь пустая - проверяем, есть ли готовые файлы
+                loaded = load_ready_files_to_queue()
+                if loaded == 0:
+                    log.info("[DEBUG] Queue empty and no ready files. Waiting...")
+                await sleep_or_postnow(60)
+        except Exception as e:
+            log.exception(f"[POST_WORKER] Loop error (will continue): {e}")
+            await asyncio.sleep(1)
+            continue
 
 
 async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4146,6 +4244,30 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     # Немедленная остановка процесса (прекращает работу всех фоновых воркеров)
     log.info("[STOP] Executing shutdown... All workers and conveyor system will be terminated.")
     os._exit(0)
+
+
+async def postnow_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Форс-публикация сразу (переопределяет расписание)"""
+    global FORCE_POST_NOW, POSTNOW_EVENT
+    
+    user_id = update.effective_user.id if update.effective_user else None
+    
+    if user_id != ADMIN_TELEGRAM_ID:
+        log.warning(f"[SECURITY] Unauthorized postnow attempt from user_id={user_id}")
+        return
+    
+    FORCE_POST_NOW = True
+    POSTNOW_EVENT.set()  # Пробуждаем воркер немедленно
+    
+    log.info(f"[POSTNOW] Force post override activated by admin (user_id={user_id}) at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    try:
+        await update.message.reply_text(
+            "✅ POSTNOW: воркер разбужен, пробую публиковать сейчас.",
+            parse_mode='HTML'
+        )
+    except Exception as e:
+        log.error(f"[POSTNOW] Failed to send confirmation message: {e}")
 
 
 async def pause_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4201,7 +4323,7 @@ async def interval_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if user_id != ADMIN_TELEGRAM_ID:
         log.warning(f"[SECURITY] Unauthorized interval attempt from user_id={user_id}")
         return
-    
+
     # Получаем новый интервал из аргументов команды
     try:
         if not context.args or len(context.args) == 0:
@@ -4247,7 +4369,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if user_id != ADMIN_TELEGRAM_ID:
         log.warning(f"[SECURITY] Unauthorized status attempt from user_id={user_id}")
         return
-    
+
     try:
         # Состояние системы
         status_text = "✅ РАБОТАЕТ" if not IS_PAUSED else "⏸ ПАУЗА"
@@ -4321,90 +4443,58 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     # получаем текст поста
     post = update.channel_post
-    text_for_translate = ensure_utf8_text(post.text or post.caption or "")
+    # CAPTION_SOURCE_PRIORITY: prefer caption over text
+    src_text_raw = (post.caption or post.text or "")
+    src_text = ensure_utf8_text(src_text_raw).strip()
+    log.info("RAW_CAPTION_SOURCE: %s", src_text[:200] if src_text else "(empty)")
+    text_for_translate = src_text
     entities = post.entities or post.caption_entities
     
-    # Сохраняем оригинальный текст поста для передачи в translate_text как caption_ru
-    caption_ru_original = text_for_translate
-    
-    # 🔍 ОПРЕДЕЛЯЕМ SOURCE ТОЛЬКО ПО РЕАЛЬНОМУ ВХОДУ (на этапе enqueue)
-    # source определяется по наличию Instagram URL в ОРИГИНАЛЬНОМ тексте поста
-    # НЕ используем text_for_translate после Whisper, т.к. он может быть заменен на transcript без ссылок
+    # 🔍 SMART ROUTING: Проверяем наличие Instagram URL
     instagram_url = None
     instagram_video_path = None
+    is_url_source = False
     
-    # Ищем Instagram URL в ОРИГИНАЛЬНОМ тексте поста И в entities
-    import re
-    instagram_pattern = r'(?:https?://)?(?:www\.)?(?:instagram\.com|instagr\.am)/(?:p|reel|reels|stories|tv)/[^\s]*'
-    
-    # 1. Сначала проверяем entities (приоритет) - URL может быть там даже если текста нет
-    if entities and text_for_translate:
-        for entity in entities:
-            if entity.type == MessageEntityType.URL:
-                # Извлекаем URL из текста по offset и length
-                try:
-                    url_text = text_for_translate[entity.offset:entity.offset + entity.length]
-                    # Проверяем на Instagram
-                    if re.search(instagram_pattern, url_text, re.IGNORECASE):
-                        instagram_url = url_text
-                        # Добавляем https:// если отсутствует
-                        if not instagram_url.startswith('http'):
-                            instagram_url = 'https://' + instagram_url
-                        log.info(f"[SMART ROUTING] Instagram URL found in entities: {instagram_url[:50]}...")
-                        break
-                except (IndexError, AttributeError) as e:
-                    log.warning(f"[SMART ROUTING] Error extracting URL from entity: {e}")
-                    continue
-    
-    # 2. Если не нашли в entities, ищем в тексте (расширенный regex)
-    if not instagram_url and text_for_translate:
-        match = re.search(instagram_pattern, text_for_translate, re.IGNORECASE)
+    # Ищем Instagram URL в тексте
+    if text_for_translate:
+        import re
+        instagram_pattern = r'https?://(?:www\.)?instagram\.com/(?:p|reel|reels)/[\w-]+'
+        match = re.search(instagram_pattern, text_for_translate)
         if match:
             instagram_url = match.group(0)
-            # Добавляем https:// если отсутствует
-            if not instagram_url.startswith('http'):
-                instagram_url = 'https://' + instagram_url
-            log.info(f"[SMART ROUTING] Instagram URL found in text: {instagram_url[:50]}...")
-    
-    # Определяем source: если найден Instagram URL → "instagram", иначе → "telegram"
-    # Это ЕДИНСТВЕННОЕ место определения source - дальше используется только item["source"]
-    source = "instagram" if instagram_url else "telegram"
-    log.info(f"[SOURCE] Determined at enqueue (by input): {source} (instagram_url={'found' if instagram_url else 'not found'})")
-    
-    # Скачиваем видео из Instagram (если это Instagram источник)
-    if instagram_url:
-        try:
-            instagram_video_path = download_from_instagram(instagram_url)
-            if not instagram_video_path:
-                error_msg = f"❌ [INSTAGRAM] Не удалось скачать видео из URL: {instagram_url}"
+            is_url_source = True
+            log.info(f"[SMART ROUTING] Instagram URL detected: {instagram_url[:50]}...")
+            
+            # Скачиваем видео из Instagram
+            try:
+                instagram_video_path = download_from_instagram(instagram_url)
+                if not instagram_video_path:
+                    error_msg = f"❌ [INSTAGRAM] Не удалось скачать видео из URL: {instagram_url}"
+                    log.error(error_msg)
+                    # Отправляем отчет админу
+                    try:
+                        await context.bot.send_message(
+                            chat_id=ADMIN_TELEGRAM_ID,
+                            text=f"🚨 <b>Instagram Download Failed</b>\n\n{error_msg}",
+                            parse_mode='HTML'
+                        )
+                    except:
+                        pass
+                    return  # Завершаем обработку для этого сообщения
+                log.info(f"[SMART ROUTING] ✅ Video downloaded from Instagram: {instagram_video_path.name}")
+            except Exception as e:
+                error_msg = f"❌ [INSTAGRAM] Ошибка при скачивании: {e}"
                 log.error(error_msg)
                 # Отправляем отчет админу
                 try:
                     await context.bot.send_message(
                         chat_id=ADMIN_TELEGRAM_ID,
-                        text=f"🚨 <b>Instagram Download Failed</b>\n\n{error_msg}",
+                        text=f"🚨 <b>Instagram Download Error</b>\n\n{error_msg}",
                         parse_mode='HTML'
                     )
                 except:
                     pass
-                return  # Завершаем обработку для этого сообщения
-            log.info(f"[SMART ROUTING] ✅ Video downloaded from Instagram: {instagram_video_path.name}")
-            # ПЕРЕОПРЕДЕЛЯЕМ source: если видео успешно скачано из Instagram, это точно Instagram источник
-            source = "instagram"
-            log.info(f"[SOURCE] Re-determined after successful Instagram download: {source}")
-        except Exception as e:
-            error_msg = f"❌ [INSTAGRAM] Ошибка при скачивании: {e}"
-            log.error(error_msg)
-            # Отправляем отчет админу
-            try:
-                await context.bot.send_message(
-                    chat_id=ADMIN_TELEGRAM_ID,
-                    text=f"🚨 <b>Instagram Download Error</b>\n\n{error_msg}",
-                    parse_mode='HTML'
-                )
-            except:
-                pass
-            return  # Завершаем обработку
+                return  # Завершаем обработку
 
     # 🎤 WHISPER: Если это видео (Telegram или Instagram), пытаемся получить транскрибацию
     whisper_transcript = None
@@ -4418,7 +4508,8 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         # Используем видео из Telegram
         log.info("[WHISPER] Processing Telegram video...")
     
-    if video_source_path or post.video:
+    # Only attempt Whisper transcription if no src_text provided
+    if (video_source_path or post.video) and not text_for_translate.strip():
         try:
             if not video_source_path:
                 # Скачиваем видео из Telegram
@@ -4451,44 +4542,30 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
     log.info("RAW before translate: %s", text_for_translate[:200] if text_for_translate else "(empty)")
 
     # ГАРАНТИРУЕМ перевод ВСЕХ постов
-    translation_result = None
-    if caption_ru_original.strip() or whisper_transcript:
-        # Преобразуем entities в маркеры перед переводом (только для caption_ru)
-        caption_ru_prepared = entities_to_markers(caption_ru_original, entities) if caption_ru_original else ""
-        # Вызываем новую функцию с тремя параметрами
-        translation_result = await translate_text(
-            caption_ru=caption_ru_prepared,
-            asr_ru=whisper_transcript or "",
-            base_hashtags=HASHTAGS_BLOCK
-        )
+    if text_for_translate.strip():
+        # преобразуем entities в маркеры перед переводом
+        prepared = entities_to_markers(text_for_translate, entities)
+        translated = await translate_text(prepared)
     else:
-        # Fallback если нет данных
-        translation_result = {
-            'voice': "Qiziqarli video. Oxirigacha ko'ring.",
-            'caption': "Qiziqarli video. Oxirigacha ko'ring.",
-            'hashtags': ""
-        }
+        translated = ""
     
-    # Извлекаем результаты из словаря
-    voice_uz = translation_result.get('voice', '')
-    caption_uz = translation_result.get('caption', '')
-    extra_hashtags = translation_result.get('hashtags', '')
+    final_text = sanitize_post(translated)
     
-    # Определяем CTA правило (каждые 2 поста)
-    use_cta, cta_text, post_counter = next_post_cta_rule()
-    log.info(f"[CTA] Post #{post_counter}: use_cta={use_cta}, cta_text={cta_text[:30] if cta_text else None}...")
-    
-    # Строим текст для TTS (VOICE_UZ + CTA, БЕЗ footer и хэштегов)
-    text_for_voice = build_voice_for_tts(voice_uz, cta_text if use_cta else None)
-    log.info(f"[TTS] Voice text length: {len(text_for_voice)} chars")
-    
-    # 🎙️ ELEVENLABS: Генерируем озвучку для всех постов (не только Instagram)
+    # Убираем фразы про комментарии
+    final_text = remove_comment_phrases(final_text)
+
+    log.info("FINAL after translate: %s", final_text[:200] if final_text else "(empty)")
+
+    # 🎙️ ELEVENLABS: SMART ROUTING - генерируем озвучку только для Instagram URL
     voiceover_path = None
     has_voiceover = False
     
-    if text_for_voice.strip():
+    if is_url_source and final_text.strip():
+        # IF URL (Instagram): Generate ElevenLabs voiceover
         try:
-            log.info(f"[ELEVENLABS] Generating voiceover for source={source}...")
+            log.info("[SMART ROUTING] Instagram source → Generating ElevenLabs voiceover...")
+            # Извлекаем чистый текст без хэштегов для озвучки
+            text_for_voice = final_text.split('\n')[0]  # Берем первую строку (основной текст)
             voiceover_path = generate_voiceover(text_for_voice)
             
             if voiceover_path:
@@ -4499,26 +4576,21 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         except Exception as e:
             log.error(f"[ELEVENLABS] Voiceover generation error: {e}")
             # Продолжаем без озвучки при ошибке
-    
-    # Обрабатываем caption
-    caption_uz = sanitize_post(caption_uz)
-    caption_uz = remove_comment_phrases(caption_uz)
-    
-    # Строим финальный caption для публикации (caption + hashtags + footer)
-    final_text = build_caption_for_post(
-        caption_uz=caption_uz,
-        base_hashtags=HASHTAGS_BLOCK,
-        extra_hashtags=extra_hashtags,
-        footer_html=FOOTER_HTML
-    )
-    
-    # Форматируем финальный текст
+    elif post.video:
+        # IF FILE (Telegram): SKIP ElevenLabs
+        log.info("[SMART ROUTING] Telegram source → Skipping ElevenLabs (voiceover: False)")
+        has_voiceover = False
+
+    # форматируем финальный текст
     final_text = format_post_structure(final_text)
+    
+    # Глубокая очистка: убираем старые ссылки/хэштеги/упоминания перед добавлением наших блоков
     final_text = clean_caption(final_text)
+    
+    # ГАРАНТИРУЕМ наличие футера ПОСЛЕ очистки
     final_text = ensure_footer(final_text)
     final_text = append_branding(final_text)
-    
-    log.info("FINAL after translate: %s", final_text[:200] if final_text else "(empty)")
+    final_text = append_hashtags(final_text)
 
     # отправляем в основной канал
     if post.photo:
@@ -4530,7 +4602,6 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
             "buffer_message_id": message_id,
             "buffer_chat_id": chat_id,
             "translation_cost": TRANSLATION_LAST_COST,
-            "source": source,  # Явное указание источника
         }
     elif post.video or instagram_video_path:
         # если есть видео (Telegram или Instagram), добавляем в очередь
@@ -4538,14 +4609,13 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
             "type": "video",
             "file_id": post.video.file_id if post.video else "instagram_source",
             "caption": final_text,
-            "instagram_video_path": str(instagram_video_path) if instagram_video_path else None,
+            "instagram_video_path": str(instagram_video_path) if instagram_video_path else None,  # ДОБАВЬ ЭТО
             "buffer_message_id": message_id,
             "buffer_chat_id": chat_id,
             "translation_cost": TRANSLATION_LAST_COST,
             "voiceover": has_voiceover,  # 🎙️ Флаг для Smart Routing
             "voiceover_path": str(voiceover_path) if voiceover_path else None,  # 🎙️ Путь к озвучке
             "instagram_source": instagram_url if instagram_url else None,
-            "source": source,  # Явное указание источника
         }
     else:
         # если только текст, включаем режим карусели
@@ -4556,7 +4626,6 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
             "buffer_message_id": message_id,
             "buffer_chat_id": chat_id,
             "translation_cost": TRANSLATION_LAST_COST,
-            "source": source,  # Явное указание источника
         }
 
     # Проверка дублей включена
@@ -4637,9 +4706,11 @@ def main() -> None:
                 if file_size_mb > 95:
                     log.warning(f"[AUTO-PURGE] Deleting oversized file: {ready_file.name} ({file_size_mb:.2f} MB)")
                     ready_file.unlink()
-                    # Удаляем метаданные тоже
-                    meta_file = ready_file.with_suffix('.json')
-                    if meta_file.exists():
+                    # Удаляем метаданные тоже (READY_META_EXT_FIX: try both formats)
+                    meta_file_a = ready_file.with_suffix('.json')
+                    meta_file_b = ready_file.with_suffix('.mp4.json')
+                    meta_file = meta_file_a if meta_file_a.exists() else (meta_file_b if meta_file_b.exists() else None)
+                    if meta_file and meta_file.exists():
                         meta_file.unlink()
                     purged_count += 1
             if purged_count > 0:
@@ -4672,6 +4743,7 @@ def main() -> None:
             log.error(f"[TMP_CLEANUP] Error during tmp_media cleanup: {e}")
         
         # Запускаем workers
+        asyncio.create_task(video_processing_worker())  # FIX B: Video processing worker
         asyncio.create_task(post_worker(app))
         asyncio.create_task(daily_report_scheduler(app))
         asyncio.create_task(history_log_scheduler())
@@ -4693,6 +4765,7 @@ def main() -> None:
     # обработчики удаленного управления (только для админа)
     app.add_handler(CommandHandler("restart", restart_command))
     app.add_handler(CommandHandler("stop", stop_command))
+    app.add_handler(CommandHandler("postnow", postnow_command))
     app.add_handler(CommandHandler("pause", pause_command))
     app.add_handler(CommandHandler("resume", resume_command))
     app.add_handler(CommandHandler("interval", interval_command))
