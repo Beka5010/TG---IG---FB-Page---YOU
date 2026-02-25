@@ -176,7 +176,9 @@ async def post_worker_loop(app):
             POSTNOW_EVENT.clear()
 
             try:
+                log.info("[PUBLISH_LOCK] acquiring by POSTNOW...")
                 async with PUBLISH_LOCK:
+                    log.info("[PUBLISH_LOCK] acquired by POSTNOW")
                     mp4_path, meta_path = _pick_ready_latest()
                     if not mp4_path or not mp4_path.exists():
                         ready_dir = get_ready_dir()
@@ -195,6 +197,7 @@ async def post_worker_loop(app):
                     log.info(f"[POSTNOW] send mp4={mp4_path.name}")
                     FORCE_POST_NOW = True
                     await post_worker(app, item, str(mp4_path), caption, caption_tg, caption_meta, str(mp4_path), source="POSTNOW")
+                log.info("[PUBLISH_LOCK] released by POSTNOW")
             finally:
                 FORCE_POST_NOW = False
         except Exception as e:
@@ -214,31 +217,55 @@ async def scheduled_ready_worker(app):
             if FORCE_POST_NOW:
                 await asyncio.sleep(5)
                 continue
+            
+            # === [RESTART_SAFE_MODE] Защита от автопубликации после рестарта ===
             if STARTUP_AT:
                 since_start = pytime.time() - STARTUP_AT
-                if since_start < PUBLISH_STARTUP_COOLDOWN_SEC:
-                    remaining_cd = max(1, int(PUBLISH_STARTUP_COOLDOWN_SEC - since_start))
-                    log.info("[SCHED_WORKER] startup cooldown active -> skip publish tick")
+                if since_start < RESTART_SAFE_MODE_TIMEOUT:
+                    remaining_cd = max(1, int(RESTART_SAFE_MODE_TIMEOUT - since_start))
+                    log.info(f"[SAFE_MODE] restart detected -> auto publish disabled (uptime={int(since_start)}s < {RESTART_SAFE_MODE_TIMEOUT}s)")
                     await asyncio.sleep(min(remaining_cd, 15))
                     continue
+            
+            # === [STRICT_60_MIN] Жёсткий интервал 60 минут ===
+            if LAST_POST_TIME:
+                since_last = (datetime.now() - LAST_POST_TIME).total_seconds()
+                if since_last < PUBLISH_STRICT_INTERVAL_SEC:
+                    remaining_wait = int(PUBLISH_STRICT_INTERVAL_SEC - since_last)
+                    log.info(f"[SCHED_GUARD] Too early: {int(since_last)}s since last post < {PUBLISH_STRICT_INTERVAL_SEC}s -> skip (wait {remaining_wait}s)")
+                    await asyncio.sleep(min(remaining_wait, 60))
+                    continue
 
+            # [SLOT_SCHEDULE] Проверка слотов (10 постов/день)
             due, remaining = _schedule_due_state()
-            log.info(f"[SCHED_WORKER] due? {due} (remaining={remaining}s)")
+            
             if not due:
                 await asyncio.sleep(min(max(remaining, 15), 120))
                 continue
 
+            log.info("[PUBLISH_LOCK] acquiring by SCHEDULED...")
             async with PUBLISH_LOCK:
+                log.info("[PUBLISH_LOCK] acquired by SCHEDULED")
+                # [ORPHAN_CLEANUP] \u041f\u0435\u0440\u0438\u043e\u0434\u0438\u0447\u0435\u0441\u043a\u0430\u044f \u043e\u0447\u0438\u0441\u0442\u043a\u0430 orphan json \u0444\u0430\u0439\u043b\u043e\u0432
+                try:
+                    orphan_count = cleanup_orphan_json_files()
+                    if orphan_count > 0:
+                        log.info(f"[ORPHAN_CLEANUP] Cleaned {orphan_count} orphan json files")
+                except Exception as oe:
+                    log.warning(f"[ORPHAN_CLEANUP] error: {oe}")
+                
                 mp4_path, meta_path = _pick_ready_fifo()
                 if not mp4_path or not mp4_path.exists():
                     ready_dir = get_ready_dir()
                     log.warning(f"[SCHED_WORKER] no ready files to publish (FIFO) dir={ready_dir}")
+                    log.info("[PUBLISH_LOCK] released by SCHEDULED (no files)")
                     await asyncio.sleep(30)
                     continue
                 meta_data = _load_ready_metadata(mp4_path, meta_path)
                 item, caption, caption_tg, caption_meta = _build_ready_item(mp4_path, meta_data)
                 log.info(f"[SCHED_WORKER] publishing {mp4_path.name}")
                 await post_worker(app, item, str(mp4_path), caption, caption_tg, caption_meta, str(mp4_path), source="SCHEDULE")
+            log.info("[PUBLISH_LOCK] released by SCHEDULED")
             await asyncio.sleep(5)
         except Exception as exc:
             log.exception(f"[SCHED_WORKER] error: {exc}")
@@ -248,7 +275,6 @@ from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, ContextTypes, filters
 from telegram.error import Conflict
 from telethon_downloader import download_by_chat_and_msgid
-
 
 import os
 import sys
@@ -309,6 +335,19 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN")
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN not set. Add it to .env or Windows env vars.")
 
+# === [STOP_PIPELINE_CRASH] Проверка доступности Telethon ===
+_TELETHON_API_ID = os.getenv("TELETHON_API_ID", "").strip()
+_TELETHON_API_HASH = os.getenv("TELETHON_API_HASH", "").strip()
+TELETHON_CONFIGURED = bool(_TELETHON_API_ID and _TELETHON_API_HASH)
+
+if not TELETHON_CONFIGURED:
+    log.warning("[TELETHON] Missing ENV variables! Telethon fallback disabled.")
+    log.warning(f"[TELETHON] API_ID set: {bool(_TELETHON_API_ID)}, API_HASH set: {bool(_TELETHON_API_HASH)}")
+
+def is_telethon_configured() -> bool:
+    """[STOP_PIPELINE_CRASH] Проверяет готовность Telethon (ENV переменные заданы)."""
+    return TELETHON_CONFIGURED
+
 # Импорт для работы с изображениями
 from PIL import Image, ImageDraw, ImageFont
 
@@ -361,10 +400,30 @@ CHANNEL_LINK = "https://t.me/+19xSNtVpJx1hZGQy"
 FOOTER_HTML = f"\n\n| <a href=\"{CHANNEL_LINK}\">Haqiqat 🧠</a> | <a href=\"{CHANNEL_LINK}\">Kanalga obuna bo'ling</a>"
 BRANDED_LINK = f"👉 Batafsil: {CHANNEL_LINK}"
 HASHTAGS_BLOCK = "#haqiqat #uzbekistan #qiziqarli"
-PUBLISH_INTERVAL_SECONDS = 3600  # 60 минут
+PUBLISH_INTERVAL_SECONDS = 3600  # 60 минут (fallback, если слоты отключены)
+
+# === [SLOT_SCHEDULE] 10 постов в день по фиксированным слотам (локальное время) ===
+# Слоты распределены равномерно с 08:00 до 22:00 (14 часов / 10 постов ≈ каждые 84 мин)
+PUBLISH_SLOTS = [
+    "08:00",
+    "09:30",
+    "11:00",
+    "12:30",
+    "14:00",
+    "15:30",
+    "17:00",
+    "18:30",
+    "20:00",
+    "21:30",
+]
+SLOTS_USED_TODAY: set[str] = set()  # Слоты использованные сегодня
+SLOTS_LAST_RESET_DATE: str = ""     # Дата последнего сброса слотов (YYYY-MM-DD)
+
 LINK_BLOCK_HTML = '| <a href="https://t.me/+19xSNtVpjx1hZGQy">Haqiqat 🧠 | Kanalga obuna bo\'ling</a> |'
-CAPTION_MAX_LENGTH = 900  # Лимит для caption
-IG_CAPTION_LIMIT = 2100   # Безопасный предел под ограничение Instagram (2200)
+# === [CAPTION_FULL_TEXT] Реальные лимиты API платформ (без искусственной обрезки) ===
+CAPTION_MAX_LENGTH = 4096   # Telegram API лимит (было 900)
+IG_CAPTION_LIMIT = 2200     # Instagram API лимит (было 2100)
+FB_CAPTION_LIMIT = 63206    # Facebook API лимит
 
 # Админ-чат для отчётов
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "").strip()
@@ -715,6 +774,18 @@ def clean_overlay_text(text: str, max_lines: int = 2) -> tuple[str, dict]:
     had_html = False
     had_url = False
     had_brand = False
+    
+    # === [CLEAN_OVERLAY_PREFIX_V1] Убираем мусорные символы в начале строки ===
+    # Удаляем: ▢, □, ■, ▪, ▫, �, •, ●, ○, [], \uFFFD и подобные в НАЧАЛЕ
+    before_prefix = text[:60] if len(text) > 60 else text
+    # Паттерн: мусорные символы/квадраты/точки + пробелы в начале
+    text = re.sub(r'^[\s\u25a2\u25a1\u25a0\u25aa\u25ab\ufffd\u2022\u25cf\u25cb\u25b6\u25b7\u25c0\u25c1\u2610\u2611\u2612\[\]\(\)\{\}\*\-\~\|]+', '', text)
+    # Убираем непечатные символы в начале (кроме пробелов)
+    text = re.sub(r'^[\x00-\x1f\x7f-\x9f]+', '', text)
+    text = text.lstrip()  # Убираем оставшиеся пробелы в начале
+    after_prefix = text[:60] if len(text) > 60 else text
+    if before_prefix != after_prefix:
+        log.info(f'[OVERLAY_SANITIZE] before="{before_prefix}" after="{after_prefix}"')
     
     # Удалить HTML теги
     if re.search(r"<[^>]+>", text):
@@ -1181,6 +1252,7 @@ def _build_ready_item(mp4_path: Path, meta_data: dict) -> tuple[dict, str, str, 
 
 
 def _archive_ready_artifacts(mp4_path: Path) -> None:
+    """Переносит mp4 + json в published/. Логирует детально."""
     if not mp4_path or not mp4_path.exists():
         return
     try:
@@ -1189,15 +1261,56 @@ def _archive_ready_artifacts(mp4_path: Path) -> None:
             dest_mp4 = PUBLISHED_DIR / f"{mp4_path.stem}_{int(pytime.time())}{mp4_path.suffix}"
         dest_mp4.parent.mkdir(exist_ok=True)
         shutil.move(str(mp4_path), str(dest_mp4))
+        log.info(f"[READY_ARCHIVE] mp4 moved: {mp4_path.name} -> published/{dest_mp4.name}")
+        
+        # [ARCHIVE_JSON_FIX] Переносим json вместе с mp4
         meta_path = _resolve_ready_json(mp4_path)
         if meta_path and meta_path.exists():
             dest_meta = PUBLISHED_DIR / meta_path.name
             if dest_meta.exists():
                 dest_meta = PUBLISHED_DIR / f"{meta_path.stem}_{int(pytime.time())}{meta_path.suffix}"
             shutil.move(str(meta_path), str(dest_meta))
-        log.info(f"[READY_ARCHIVE] moved {mp4_path.name} -> published/{dest_mp4.name}")
+            log.info(f"[READY_ARCHIVE] json moved: {meta_path.name} -> published/{dest_meta.name}")
+        else:
+            log.warning(f"[READY_ARCHIVE] json not found for {mp4_path.name} (may already be moved)")
     except Exception as exc:
         log.warning(f"[READY_ARCHIVE] failed to archive {mp4_path}: {exc}")
+
+
+def cleanup_orphan_json_files() -> int:
+    """Удаляет/перемещает orphan json файлы (без соответствующего mp4) из ready_to_publish."""
+    orphan_count = 0
+    try:
+        ready_dir = get_ready_dir()
+        failed_dir = ready_dir / "_failed_json"
+        failed_dir.mkdir(exist_ok=True)
+        
+        # Находим все json файлы
+        json_files = list(ready_dir.glob("*.json"))
+        for json_path in json_files:
+            # Определяем соответствующий mp4
+            stem = json_path.stem
+            if stem.endswith(".mp4"):
+                stem = stem[:-4]  # Убираем .mp4 из .mp4.json
+            
+            mp4_candidates = [
+                ready_dir / f"{stem}.mp4",
+                ready_dir / f"{json_path.stem}.mp4"
+            ]
+            
+            mp4_exists = any(p.exists() for p in mp4_candidates)
+            
+            if not mp4_exists:
+                # Orphan json - переносим в _failed_json
+                dest = failed_dir / json_path.name
+                if dest.exists():
+                    dest = failed_dir / f"{json_path.stem}_{int(pytime.time())}.json"
+                shutil.move(str(json_path), str(dest))
+                log.info(f"[ORPHAN_JSON] moved {json_path.name} -> _failed_json/{dest.name}")
+                orphan_count += 1
+    except Exception as exc:
+        log.warning(f"[ORPHAN_JSON] cleanup error: {exc}")
+    return orphan_count
 
 
 class LockedFileError(Exception):
@@ -1251,16 +1364,19 @@ def _wait_file_unlock(path: str, tries: int = 25, sleep_s: float = 0.2) -> bool:
 
 
 def _safe_remove_file(path: str, tries: int = 25, sleep_s: float = 0.2) -> None:
-    """Remove file with Windows lock retry logic."""
+    """[STOP_PIPELINE_CRASH] Remove file with Windows lock retry logic + [TMP_LOCK] log."""
     gc.collect()
     _wait_file_unlock(path, tries=tries, sleep_s=sleep_s)
-    for _ in range(tries):
+    for attempt in range(tries):
         try:
             if os.path.exists(path):
                 os.remove(path)
             return
         except PermissionError:
             pytime.sleep(sleep_s)
+    # Если после всех попыток файл не удалён - логируем, но НЕ падаем
+    if os.path.exists(path):
+        log.warning(f"[TMP_LOCK] could not delete after {tries} retries: {path}")
 
 
 def _safe_move_file(src: str, dst: str, tries: int = 25, sleep_s: float = 0.2) -> None:
@@ -1389,6 +1505,9 @@ SEEN_HASHES = set()
 SEEN_FILE_IDS = set()
 PURGE_ON_STARTUP = False
 STARTUP_STRIKE_ENABLED = False
+# === [RESTART_SAFE_MODE] Защита от автопубликации после рестарта ===
+RESTART_SAFE_MODE = True  # При старте = True, сбрасывается после первой успешной публикации или /postnow
+RESTART_SAFE_MODE_TIMEOUT = 120  # Секунд после старта, в течение которых автопубликация заблокирована
 PUBLISHED_KEYS_FILE = Path("published_keys.json")
 PUBLISHED_KEYS = set()
 
@@ -1412,7 +1531,8 @@ FORCE_POST_NOW = False  # ❌ DISABLED: Флаг для форс-публика�
 POSTNOW_EVENT = asyncio.Event()  # Event для немедленного пробуждения воркера
 POSTNOW_TRIGGER_LOCK = asyncio.Lock()
 STARTUP_AT: float | None = None
-PUBLISH_STARTUP_COOLDOWN_SEC = int(os.getenv("PUBLISH_STARTUP_COOLDOWN_SEC", "120"))
+PUBLISH_STARTUP_COOLDOWN_SEC = 120  # [RESTART_SAFE] Строго 120 сек после старта
+PUBLISH_STRICT_INTERVAL_SEC = 3600  # [STRICT_60_MIN] Строго 60 минут между публикациями
 VIDEO_MIRROR_TOGGLE = False
 
 
@@ -1445,13 +1565,133 @@ def _schedule_reference_time() -> datetime | None:
     return None
 
 
+def _reset_slots_if_new_day():
+    """[SLOT_SCHEDULE] Сброс использованных слотов при наступлении нового дня."""
+    global SLOTS_USED_TODAY, SLOTS_LAST_RESET_DATE
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    if SLOTS_LAST_RESET_DATE != today_str:
+        log.info(f"[SLOT_RESET] New day detected: {SLOTS_LAST_RESET_DATE} -> {today_str}, clearing used slots")
+        SLOTS_USED_TODAY = set()
+        SLOTS_LAST_RESET_DATE = today_str
+
+
+def _get_current_slot_info() -> dict:
+    """[SLOT_SCHEDULE] Определяет текущий/следующий слот и статус.
+    
+    Returns:
+        dict с ключами: now_str, next_slot, used_today, allow, reason, wait_seconds
+    """
+    _reset_slots_if_new_day()
+    
+    now = datetime.now()
+    now_str = now.strftime("%H:%M:%S")
+    today_str = now.strftime("%Y-%m-%d")
+    used_count = len(SLOTS_USED_TODAY)
+    
+    # Найти ближайший слот (текущий или будущий)
+    current_slot = None
+    next_slot = None
+    wait_seconds = 0
+    
+    for slot_time in PUBLISH_SLOTS:
+        slot_dt = datetime.strptime(f"{today_str} {slot_time}", "%Y-%m-%d %H:%M")
+        
+        # Слот считается "активным" если мы в пределах 5 минут после него
+        # и он ещё не использован
+        slot_end = slot_dt + timedelta(minutes=5)
+        
+        if slot_dt <= now <= slot_end:
+            # Мы в окне этого слота
+            if slot_time not in SLOTS_USED_TODAY:
+                current_slot = slot_time
+                break
+        elif slot_dt > now:
+            # Это будущий слот
+            if not next_slot:
+                next_slot = slot_time
+                wait_seconds = int((slot_dt - now).total_seconds())
+            break
+    
+    # Определяем результат
+    if current_slot:
+        return {
+            "now_str": now_str,
+            "next_slot": current_slot,
+            "used_today": used_count,
+            "allow": True,
+            "reason": "slot_active",
+            "wait_seconds": 0,
+            "active_slot": current_slot
+        }
+    elif next_slot:
+        return {
+            "now_str": now_str,
+            "next_slot": next_slot,
+            "used_today": used_count,
+            "allow": False,
+            "reason": "not_time",
+            "wait_seconds": wait_seconds,
+            "active_slot": None
+        }
+    else:
+        # Все слоты на сегодня прошли
+        # Вычисляем время до первого слота завтра
+        tomorrow = now + timedelta(days=1)
+        tomorrow_str = tomorrow.strftime("%Y-%m-%d")
+        first_slot_tomorrow = datetime.strptime(f"{tomorrow_str} {PUBLISH_SLOTS[0]}", "%Y-%m-%d %H:%M")
+        wait_seconds = int((first_slot_tomorrow - now).total_seconds())
+        
+        return {
+            "now_str": now_str,
+            "next_slot": f"{PUBLISH_SLOTS[0]} (tomorrow)",
+            "used_today": used_count,
+            "allow": False,
+            "reason": "all_slots_passed",
+            "wait_seconds": min(wait_seconds, 3600),  # Макс 1 час ожидания
+            "active_slot": None
+        }
+
+
+def _mark_slot_used(slot_time: str | None = None):
+    """[SLOT_SCHEDULE] Помечает слот как использованный. Если slot_time не указан — помечает текущий/ближайший."""
+    global SLOTS_USED_TODAY
+    _reset_slots_if_new_day()
+    
+    if slot_time:
+        SLOTS_USED_TODAY.add(slot_time)
+        log.info(f"[SLOT_USED] marked={slot_time} total_used={len(SLOTS_USED_TODAY)}/10")
+        return
+    
+    # Найти текущий активный слот
+    info = _get_current_slot_info()
+    if info.get("active_slot"):
+        SLOTS_USED_TODAY.add(info["active_slot"])
+        log.info(f"[SLOT_USED] marked={info['active_slot']} total_used={len(SLOTS_USED_TODAY)}/10")
+    else:
+        # Помечаем ближайший прошедший слот
+        now = datetime.now()
+        today_str = now.strftime("%Y-%m-%d")
+        for slot_time in reversed(PUBLISH_SLOTS):
+            slot_dt = datetime.strptime(f"{today_str} {slot_time}", "%Y-%m-%d %H:%M")
+            if slot_dt <= now and slot_time not in SLOTS_USED_TODAY:
+                SLOTS_USED_TODAY.add(slot_time)
+                log.info(f"[SLOT_USED] marked_nearest_past={slot_time} total_used={len(SLOTS_USED_TODAY)}/10")
+                return
+        log.warning("[SLOT_USED] no slot to mark")
+
+
 def _schedule_due_state() -> tuple[bool, int]:
-    ref = _schedule_reference_time()
-    if not ref:
-        return False, PUBLISH_INTERVAL_SECONDS
-    elapsed = (datetime.now() - ref).total_seconds()
-    remaining = max(0, int(PUBLISH_INTERVAL_SECONDS - elapsed))
-    return elapsed >= PUBLISH_INTERVAL_SECONDS, remaining
+    """[SLOT_SCHEDULE] Проверяет можно ли публиковать по слотам.
+    
+    Returns:
+        (allow: bool, wait_seconds: int)
+    """
+    info = _get_current_slot_info()
+    
+    # Логирование [SLOT_SCHED]
+    log.info(f"[SLOT_SCHED] now={info['now_str']} next_slot={info['next_slot']} used_today={info['used_today']}/10 allow={info['allow']} reason={info['reason']}")
+    
+    return info["allow"], info["wait_seconds"]
 
 
 # ✅ STUB: Placeholder for delete_from_buffer to prevent crashes
@@ -2456,26 +2696,34 @@ def clean_social_text(text: str) -> str:
     return cleaned.strip()
 
 
-def _trim_caption(text: str, limit: int) -> str:
-    """Обрезает подпись до безопасной длины без ломки слов."""
+def _trim_caption(text: str, limit: int, platform: str = "unknown") -> str:
+    """[CAPTION_FULL_TEXT] Обрезает подпись ТОЛЬКО если превышен лимит API платформы."""
     if not text:
         return ""
     prepared = text.strip()
-    if len(prepared) <= limit:
+    raw_len = len(prepared)
+    
+    if raw_len <= limit:
+        log.info(f"[CAPTION_RAW_LEN] platform={platform} len={raw_len} limit={limit} truncated=False")
         return prepared
+    
+    # Обрезка ТОЛЬКО по реальному лимиту API
     safe_limit = max(3, limit)
-    return f"{prepared[: safe_limit - 3].rstrip()}..."
+    truncated = f"{prepared[: safe_limit - 3].rstrip()}..."
+    log.warning(f"[CAPTION_TRUNCATED] platform={platform} raw_len={raw_len} limit={limit} final_len={len(truncated)}")
+    log.info(f"[CAPTION_PREVIEW] head=\"{truncated[:60]}\" tail=\"{truncated[-60:]}\"")
+    return truncated
 
 
 def prepare_caption_for_publish_tg(text: str) -> str:
-    """Готовит caption для Telegram с учётом лимита и форматирования."""
-    return _trim_caption(text or "", CAPTION_MAX_LENGTH)
+    """[CAPTION_FULL_TEXT] Готовит caption для Telegram (лимит 4096 символов)."""
+    return _trim_caption(text or "", CAPTION_MAX_LENGTH, platform="telegram")
 
 
 def prepare_caption_for_publish_meta(text: str) -> str:
-    """Готовит caption для Instagram/Facebook (plain text, <= IG_CAPTION_LIMIT)."""
+    """[CAPTION_FULL_TEXT] Готовит caption для Instagram/Facebook (лимит 2200/63206)."""
     cleaned = clean_social_text(text or "")
-    return _trim_caption(cleaned, IG_CAPTION_LIMIT)
+    return _trim_caption(cleaned, IG_CAPTION_LIMIT, platform="instagram/fb")
 
 
 def ensure_utf8_text(text: str) -> str:
@@ -3140,7 +3388,9 @@ def build_caption_unified(post: dict | None, platform: str = "telegram") -> str:
     - facebook: plain text с расширенными хэштегами
     """
     post = post or {}
-    main_text = (
+    
+    # === [MAIN_TEXT_RAW] Исходный текст до очистки ===
+    raw_main_text = (
         post.get("final_translated_text")
         or post.get("translated_caption")
         or post.get("description_uz")
@@ -3149,10 +3399,23 @@ def build_caption_unified(post: dict | None, platform: str = "telegram") -> str:
         or post.get("text")
         or ""
     ).strip()
+    
+    raw_preview = raw_main_text.replace("\n", " ")[:100]
+    log.info(f'[MAIN_TEXT_RAW] preview="{raw_preview}"')
+    
+    # === [MAIN_TEXT_CLEAN] Очистка от бренд-мусора ===
+    main_text, removed_phrases = clean_main_text(raw_main_text)
+    if removed_phrases:
+        log.info(f"[MAIN_TEXT_BAN_HIT] removed={removed_phrases}")
+    
     main_text = clean_source_tail(main_text)  # Чистим только хвост источника
     
     # === SANITIZE: ШАГ 1 - Убираем мусорные символы и нормализуем UZ-ЖИВОЙ текст ===
     main_text = sanitize_uz_jivoy_text(main_text)
+    
+    # === [MAIN_TEXT_FINAL] Итоговый текст после всех очисток ===
+    final_preview = main_text.replace("\n", " ")[:100]
+    log.info(f'[MAIN_TEXT_FINAL] preview="{final_preview}"')
     
     # === АНТИДУБЛЬ: ШАГ 2 - Убираем дупликаты с overlay-текстом ===
     overlay_text = post.get("top_text") or post.get("overlay_text") or post.get("title_text") or ""
@@ -3417,6 +3680,23 @@ def strip_html_like(s: str) -> str:
     return s
 
 
+def _clamp_overlay_to_max_lines(text: str, max_lines: int = 2) -> str:
+    """[OVERLAY_2LINE_CLAMP] Строго ограничивает текст до max_lines строк.
+    
+    Обрабатывает:
+    - Реальные переводы строк \n в исходном тексте
+    - Слишком длинные однострочные тексты (режет по словам)
+    """
+    if not text:
+        return ""
+    # Разбиваем по реальным переводам строк
+    lines = text.split("\n")
+    # Берём только первые max_lines
+    lines = [ln.strip() for ln in lines[:max_lines] if ln.strip()]
+    # Если строк меньше max_lines, но текст всё ещё один длинный блок - он будет перенесён в _wrap_to_lines
+    return "\n".join(lines)
+
+
 def make_top_text_png(text: str, width: int, height: int, font_path: str, font_size: int = 15, max_lines: int = 2, font_min: int = 90, align_bottom: bool = False) -> str:
     """Рисует текст на прозрачном PNG и возвращает путь к файлу.
     
@@ -3430,6 +3710,16 @@ def make_top_text_png(text: str, width: int, height: int, font_path: str, font_s
     text = (text or "").strip()
     if not text:
         return ""
+    
+    # === [OVERLAY_2LINE_CLAMP] Строго ограничиваем до max_lines ПЕРЕД любой обработкой ===
+    original_lines_count = len([ln for ln in text.split("\n") if ln.strip()])
+    text = _clamp_overlay_to_max_lines(text, max_lines=max_lines)
+    final_lines_count = len([ln for ln in text.split("\n") if ln.strip()])
+    text_preview = text.replace("\n", " ")[:60]
+    log.info(f"[OVERLAY_LINES] lines={final_lines_count} text_preview=\"{text_preview}\"")
+    if original_lines_count > max_lines:
+        log.error(f"[OVERLAY_LINES_ERROR] original had {original_lines_count} lines, clamped to {max_lines}")
+    
     # === ШАГ 1: ОЧИСТКА TOPTEXT (CAPTION_POLISH_CLEAN_TOPTEXT_HASHTAGS_V2) ===
     text = clean_toptext(text)
     log.info(f"[TOPTEXT] cleaned={text[:80]!r}")
@@ -3557,8 +3847,12 @@ def process_video(local_path: Path, caption: str | None = None, *, source_descri
     VERT_VIDEO_SCALE = 0.9        # scale for vertical videos only (10% reduction)
     # === VERT_SAFE_TOP_SHIFT_v1: Vertical video positioning & scale safety ===
     SAFE_TOP_PX = 120             # верхняя запретная зона под текст (фиксированная граница)
-    VERT_VIDEO_Y_SHIFT = 40       # дополнительный сдвиг вниз для вертикальных видео
-    VERT_SCALE_UP = 1.06          # растяжение вертикального видео по ширине (уменьшение пустых бортов)
+    # === [VERT_TUNE_V1] Новые параметры вертикального шаблона ===
+    VERT_VIDEO_Y_SHIFT = 96       # сдвиг вниз 5% от canvas_h (1920 * 0.05 = 96)
+    VERT_SCALE_UP = 1.025         # увеличение видео на +2.5%
+    VERT_FONT_SCALE = 0.90        # уменьшение шрифта на -10%
+    # === [VERT_TEXT_GAP_V1] Отступ между текстом и видео (только вертикальные) ===
+    VERT_TEXT_GAP_PX = 24         # Воздух между нижней границей текста и верхней границей видео
     # === OVERLAY_SOURCE_CLEAN_v2: Vertical overlay spacing ===
     TOP_TEXT_PADDING_PX = 70      # отступ от верхнего края до текста
     TEXT_TO_VIDEO_GAP_PX = 35     # пустота между текстом overlay и видео
@@ -3568,7 +3862,7 @@ def process_video(local_path: Path, caption: str | None = None, *, source_descri
     TOPTEXT_SCALE = 1.00              # scale -> итоговый размер = 54
     TOPTEXT_FONT = int(TOPTEXT_BASE_FONT * TOPTEXT_SCALE * 0.85)  # reduced by 15%
     TOPTEXT_FONT_MIN = 22            # защита от сжатия в ноль (меньше)
-    TOPTEXT_VERT_EXTRA_SCALE = 0.85  # ещё -15% только для вертикали
+    TOPTEXT_VERT_EXTRA_SCALE = 0.90   # [VERT_TUNE_V1] -10% шрифт только для вертикали
     TOPTEXT_MAX_LINES = 3            # максимум 3 строки (не сжимаем текст)
     # ===================================
     
@@ -3579,6 +3873,12 @@ def process_video(local_path: Path, caption: str | None = None, *, source_descri
     # STITCHES: Checked for duration (No crashes)
     # AUDIO: Pro processing Pitch 0.2 / Tempo 0.5
     # ============================================
+    
+    # [SAFE_INIT] Initialize resources for safe cleanup in finally/except
+    clip = None
+    final_video = None
+    audio_clip = None
+    
     try:
         header_path = (Path(__file__).parent / "header.gif").resolve()
         clip = VideoFileClip(str(local_path))
@@ -3793,6 +4093,8 @@ def process_video(local_path: Path, caption: str | None = None, *, source_descri
             # Фиксируем верхнюю границу - видео никогда не поднимается выше SAFE_TOP_PX
             if top_y < SAFE_TOP_PX:
                 top_y = SAFE_TOP_PX
+            # [VERT_TUNE] Лог параметров вертикального шаблона
+            log.info(f"[VERT_TUNE] y_offset={VERT_VIDEO_Y_SHIFT}px scale={VERT_SCALE_UP:.3f} font_mul={VERT_FONT_SCALE:.2f}")
             log.info(f"[VERT_SAFE] video_y={top_y} SAFE_TOP_PX={SAFE_TOP_PX} scale={VERT_SCALE_UP} is_vertical=True")
         else:
             try:
@@ -3831,14 +4133,38 @@ def process_video(local_path: Path, caption: str | None = None, *, source_descri
         # Это гарантирует что overlay содержит ТОЛЬКО перевод без брендинга/ссылок/хэштегов
         post_payload = post_data if isinstance(post_data, dict) else None
         
+        # === ЗАЩИТА ОТ РАССИНХРОНА: Проверка binding_key ===
+        post_id = post_payload.get("id", "unknown") if post_payload else "unknown"
+        binding_key = post_payload.get("binding_key", "") if post_payload else ""
+        expected_local_path = post_payload.get("local_path", "") if post_payload else ""
+        
+        # Сравниваем ожидаемый путь с фактическим - НО не блокируем, если пусто (fallback mode)
+        actual_local_path_str = str(local_path) if local_path else ""
+        if expected_local_path and expected_local_path != actual_local_path_str:
+            log.warning(f"[BIND_MISMATCH] Path mismatch (continuing with actual)")
+            log.warning(f"[BIND_MISMATCH] post_id={post_id} expected={expected_local_path} actual={actual_local_path_str}")
+            # [FIX_BIND_MISMATCH] No longer blocking - use actual_local_path for processing
+        elif expected_local_path:
+            log.debug(f"[VERIFY_BIND] Local path match: post_id={post_id} path={actual_local_path_str}")
+        
         # Приоритет: final_translated_text (чистый перевод) > description > caption
         base_text_for_overlay = ""
+        overlay_src = "none"
         if post_payload:
             base_text_for_overlay = post_payload.get("final_translated_text", "") or ""
+            overlay_src = "final_translated_text"
         if not base_text_for_overlay and source_description:
             base_text_for_overlay = source_description
+            overlay_src = "source_description"
         if not base_text_for_overlay and caption:
             base_text_for_overlay = caption
+            overlay_src = "caption"
+        
+        # === КОНТРОЛЬНЫЙ ЛОГ: Что пошло в overlay и откуда ===
+        log.info(f"[OVERLAY_CHECK] post_id={post_id} src={overlay_src} preview={repr(base_text_for_overlay[:120])}")
+        
+        # === ЛОГИРОВАНИЕ СВЯЗКИ В process_video ===
+        log.info(f"[OVERLAY_BIND] post_id={post_id} path={os.path.basename(expected_local_path) if expected_local_path else 'no_path'} key={binding_key} src={overlay_src}")
         
         # Применяем жесткую очистку для overlay (максимум 2 строки)
         raw_overlay_text = base_text_for_overlay
@@ -3847,6 +4173,27 @@ def process_video(local_path: Path, caption: str | None = None, *, source_descri
         log.info(f"[OVERLAY_TEXT] raw_len={overlay_meta['raw_len']} clean_len={overlay_meta['clean_len']} lines={overlay_meta['lines']} contains_html={overlay_meta['had_html']} contains_url={overlay_meta['had_url']}")
         log.info(f"[OVERLAY_TEXT] raw={raw_overlay_text[:100]!r}...")
         log.info(f"[OVERLAY_TEXT] clean={top_text[:100]!r}...")
+        
+        # === HARD_BIND: Сохраняем очищенный overlay в post_data ===
+        if post_payload:
+            post_payload["overlay_text_clean"] = top_text
+            post_payload["overlay_src"] = overlay_src
+            # HAQIQAT_HARD_BIND v1.1: Унифицированная привязка (post_id, file_id стандартные)
+            # Убедимся, что post_id и file_id установлены
+            if not post_payload.get("post_id"):
+                post_payload["post_id"] = post_id
+            # Безопасно получаем file_id из post_data
+            safe_file_id = post_payload.get("file_id") or post_payload.get("haqiqat_file_id")
+            if safe_file_id and not post_payload.get("file_id"):
+                post_payload["file_id"] = safe_file_id
+            # Также сохраняем caption для полной привязки
+            caption_unified = build_caption_unified(post_payload)
+            post_payload["caption_text_clean"] = caption_unified
+        
+        # === ЛОГИРОВАНИЕ ФИНАЛЬНОЙ СВЯЗКИ OVERLAY ===
+        file_id_for_log = post_payload.get("file_id", "unknown") if post_payload else "unknown"
+        final_post_id = post_payload.get("post_id", post_id) if post_payload else post_id
+        log.info(f"[OVERLAY_BIND_SAVE] post_id={final_post_id} file_id={str(file_id_for_log)[:30]} overlay_preview={repr(top_text[:40])}")
         
         if not top_text:
             # Fallback: если after cleanup пусто, используем unified caption
@@ -3866,7 +4213,31 @@ def process_video(local_path: Path, caption: str | None = None, *, source_descri
             log.info(f"[TOPTEXT] fallback: {top_text[:100]!r}...")
         
         log.info(f"[TOPTEXT] final: {top_text!r}")
+        if not top_text and post_data:
+            # === HAQIQAT_HARD_BIND v1.0: Аварийная защита от пустого overlay-текста ===
+            # Если top_text пустой, берём caption из ТЕКУЩЕГО post_data вместо глобальных переменных
+            backup_caption = post_data.get("caption_text_clean")
+            if backup_caption:
+                log.info(f"[HARD_BIND_FALLBACK] top_text empty, using caption_text_clean from post_data")
+                top_text = build_toptext_from_unified_caption(backup_caption)
+                top_text = _normalize_uz_latin(top_text)
+                top_text = top_text.replace("👉", "").replace("⚡", "").replace("🪲", "").strip()
+                log.info(f"[HARD_BIND_FALLBACK] recovered: {top_text[:100]!r}...")
+            else:
+                log.warning(f"[HARD_BIND_FALLBACK] top_text empty AND no caption_text_clean in post_data - skipping overlay")
+        
         if top_text:
+            # === HAQIQAT_HARD_BIND v1.1: Логирование связки текста с post_id перед рендером ===
+            verify_post_id = post_data.get("post_id") if post_data else None
+            verify_file_id = post_data.get("file_id") if post_data else None
+            overlay_preview = top_text[:40] if top_text else ""
+            caption_preview = post_data.get("caption_text_clean", "")[:40] if post_data else ""
+            
+            # VERIFY_BIND: Финальная проверка связи перед рендером
+            log.info(f"[VERIFY_BIND] post_id={verify_post_id} file_id={verify_file_id or 'N/A'} video={os.path.basename(str(local_path)) if local_path else 'unknown'}")
+            log.info(f"[OVERLAY_BIND] post_id={verify_post_id} overlay_preview={repr(overlay_preview)}")
+            log.info(f"[CAPTION_BIND] post_id={verify_post_id} caption_preview={repr(caption_preview)}")
+            
             log.info(f"[TOPTEXT] render font={TOPTEXT_FONT} png_h={TOPTEXT_PNG_H} max_lines={TOPTEXT_MAX_LINES}")
             font_file = resolve_toptext_font()
             font_path = str(font_file)
@@ -3874,24 +4245,30 @@ def process_video(local_path: Path, caption: str | None = None, *, source_descri
             log.info(f"[FONT] TOPTEXT using={font_file.name}")
 
             if layout_kind == "vertical":
-                VERT_TOPTEXT_GAP_PX = 3
+                VERT_TOPTEXT_GAP_LOCAL = 3
                 VERT_TOPTEXT_PNG_H = 240
+                # [VERT_TUNE_V1] Применяем уменьшение шрифта на 10% для вертикали
+                vert_font_size = int(TOPTEXT_FONT * VERT_FONT_SCALE)
+                log.info(f"[VERT_FONT] base={TOPTEXT_FONT} scaled={vert_font_size} mul={VERT_FONT_SCALE:.2f}")
                 png_path = make_top_text_png(
                     top_text,
                     canvas_size[0],
                     VERT_TOPTEXT_PNG_H,
                     font_path,
-                    font_size=TOPTEXT_FONT,
+                    font_size=vert_font_size,
                     max_lines=TOPTEXT_MAX_LINES,
                     font_min=TOPTEXT_FONT_MIN,
                     align_bottom=True
                 )
                 top_text_clip = ImageClip(png_path).set_duration(duration)
                 video_top = int(top_y)
-                text_y = video_top - VERT_TOPTEXT_PNG_H + 10
+                # [VERT_TEXT_GAP_V1] Добавляем отступ между текстом и видео
+                text_bottom = video_top - VERT_TEXT_GAP_PX  # Нижняя граница текста с учётом gap
+                text_y = text_bottom - VERT_TOPTEXT_PNG_H + 10
                 if text_y < TOP_SAFE_PX:
                     text_y = TOP_SAFE_PX
                 layers.append(top_text_clip.set_position(("center", text_y)))
+                log.info(f"[VERT_LAYOUT] text_bottom={text_bottom} video_y={video_top} gap_px={VERT_TEXT_GAP_PX}")
                 log.info(f"[VERT_ONLY] anchored: video_top={video_top} text_y={text_y} png_h={VERT_TOPTEXT_PNG_H} align=bottom")
             else:
                 png_path = make_top_text_png(top_text, canvas_size[0], TOPTEXT_PNG_H, font_path, font_size=TOPTEXT_FONT, max_lines=TOPTEXT_MAX_LINES, font_min=TOPTEXT_FONT_MIN)
@@ -4020,7 +4397,6 @@ def process_video(local_path: Path, caption: str | None = None, *, source_descri
                 log.warning(f"[SAFE_DURATION] Audio adjust failed: {audio_err}")
         
         # Запись видео с гарантированным закрытием ресурсов (WIN_LOCK_FIX_V1)
-        audio_clip = None
         try:
             final_video.write_videofile(
                 str(out_path),
@@ -4038,7 +4414,7 @@ def process_video(local_path: Path, caption: str | None = None, *, source_descri
             log.info("INFO | [PROCESS] Video unique processing: Success")
         finally:
             # Гарантированное закрытие всех открытых клипов (избегаем WinError 32 на Windows)
-            for obj in (audio_clip, final_video):
+            for obj in (clip, audio_clip, final_video):
                 try:
                     if obj is not None and hasattr(obj, 'close'):
                         obj.close()
@@ -4126,10 +4502,18 @@ def process_video(local_path: Path, caption: str | None = None, *, source_descri
         return out_path
     except Exception as e:
         log.error(f"Video processing failed, not sending original: {e}")
+        # [SAFE_CLOSE] Ensure all resources are closed on error
         try:
-            clip.close()
+            for obj in (clip, audio_clip, final_video):
+                if obj is not None and hasattr(obj, 'close'):
+                    try:
+                        obj.close()
+                    except Exception:
+                        pass
         except Exception:
             pass
+        gc.collect()
+        pytime.sleep(0.1)
         return None
 
 
@@ -4189,16 +4573,28 @@ async def prepare_video_for_ready(application, item: dict) -> Path | None:
                     log.info(f"[CONVEYOR] Downloaded raw video: {local_path.name}")
                 except Exception as download_err:
                     if _is_file_too_big_error(download_err):
-                        log.warning(f"[CONVEYOR] BotAPI FileTooBig -> Telethon fallback ({str(download_err)[:120]})")
+                        # === [STOP_PIPELINE_CRASH] FileTooBig safe-skip ===
+                        log.warning(f"[CONVEYOR] BotAPI FileTooBig detected ({str(download_err)[:120]})")
+                        
+                        # Проверяем доступность Telethon ПЕРЕД попыткой
+                        if not is_telethon_configured():
+                            # Telethon НЕ настроен - safe-skip, НЕ crash
+                            item["last_prepare_error"] = "filetoobig_skip"
+                            item["last_prepare_error_detail"] = "FileTooBig, Telethon not configured - skipping"
+                            log.warning(f"[DL_SKIP] FileTooBig, Telethon not configured, skipping post_id={item.get('id','?')} file_id={video_file_id[:20]}...")
+                            return None  # safe-skip, continue queue
+                        
                         chat_id = item.get("tg_chat_id") or item.get("buffer_chat_id")
                         msg_id = item.get("tg_message_id") or item.get("buffer_message_id")
                         if not chat_id or not msg_id:
-                            item["last_prepare_error"] = "telethon_failed"
+                            item["last_prepare_error"] = "filetoobig_skip"
                             item["last_prepare_error_detail"] = "Missing chat_id/message_id for Telethon fallback"
-                            log.error("[CONVEYOR] Telethon fallback impossible: missing chat/message id")
-                            return None
+                            log.warning(f"[DL_SKIP] FileTooBig, missing chat/msg id, skipping post_id={item.get('id','?')} file_id={video_file_id[:20]}...")
+                            return None  # safe-skip, continue queue
+                        
                         fallback_target = tentative_path
                         try:
+                            log.info(f"[CONVEYOR] Telethon fallback attempt: chat={chat_id} msg={msg_id}")
                             telethon_saved = await download_by_chat_and_msgid(int(chat_id), int(msg_id), str(fallback_target))
                             saved_path = Path(telethon_saved)
                             if not saved_path.exists():
@@ -4206,10 +4602,10 @@ async def prepare_video_for_ready(application, item: dict) -> Path | None:
                             local_path = saved_path
                             log.info(f"[CONVEYOR] Telethon fallback saved: {saved_path.name}")
                         except Exception as tele_err:
-                            item["last_prepare_error"] = "telethon_failed"
-                            item["last_prepare_error_detail"] = str(tele_err)
-                            log.error(f"[CONVEYOR] Telethon fallback failed: {tele_err}")
-                            return None
+                            item["last_prepare_error"] = "filetoobig_skip"
+                            item["last_prepare_error_detail"] = f"Telethon failed: {tele_err}"
+                            log.warning(f"[DL_SKIP] FileTooBig, Telethon failed ({tele_err}), skipping post_id={item.get('id','?')}")
+                            return None  # safe-skip, continue queue
                     else:
                         item["last_prepare_error"] = "tg_download_error"
                         item["last_prepare_error_detail"] = str(download_err)
@@ -4304,6 +4700,9 @@ async def prepare_video_for_ready(application, item: dict) -> Path | None:
         brightness = random.uniform(0.01, 0.03)  # Случайная яркость
         voiceover_path = item.get("voiceover_path")  # 🎙️ Путь к озвучке
         
+        # [BIND_FIX] Ensure post_data contains local_path for BIND_MISMATCH check
+        item["local_path"] = str(local_path)
+        
         processed_path = process_video(
             local_path,
             caption,
@@ -4338,6 +4737,11 @@ async def prepare_video_for_ready(application, item: dict) -> Path | None:
         log.info(f"[CONVEYOR] Saving ready video: {ready_path.name}")
         log.info(f"[CONVEYOR] Ready directory: {ready_dir}")
         log.info(f"[CONVEYOR] Ready path (absolute): {ready_path.resolve()}")
+        
+        # [READY_WRITE] Log binding info before writing to ready_to_publish
+        ready_post_id = item.get("post_id") or item.get("id") or base_post_id
+        ready_overlay_preview = item.get("overlay_text_clean", "")[:40] or "(no overlay)"
+        log.info(f"[READY_WRITE] BINDING post_id={ready_post_id} overlay_preview={repr(ready_overlay_preview)} mp4={ready_path.name}")
         
         # WIN_LOCK_FIX_V1: Use safe move with unlock wait
         log.info(f"[CLEANUP] unlock_wait={_wait_file_unlock(str(processed_path))} path={processed_path}")
@@ -4386,9 +4790,15 @@ async def prepare_video_for_ready(application, item: dict) -> Path | None:
                 "tg_chat_id": item.get("tg_chat_id"),
                 "tg_message_id": item.get("tg_message_id"),
                 "failures": int(item.get("failures") or 0),
+                # HAQIQAT_HARD_BIND v1.1: Унифицированная привязка (используем стандартные post_id, file_id)
+                "post_id": item.get("post_id") or item.get("id") or base_post_id,
+                "file_id": item.get("file_id") or "",
+                "overlay_text_clean": item.get("overlay_text_clean") or "",
+                "caption_text_clean": item.get("caption_text_clean") or caption_unified_meta,
             }
             meta_path.write_text(json.dumps(meta_obj, ensure_ascii=False, indent=2), encoding='utf-8')
             log.info(f"[CONVEYOR] Ready meta saved: {meta_path.name} (exists={meta_path.exists()})")
+            log.info(f"[READY_WRITE] META_JSON post_id={ready_post_id} json={meta_path.name} has_overlay={bool(item.get('overlay_text_clean'))}")
             log.info(f"[PIPE] READY_OK mp4={ready_path} json={meta_path}")
         except Exception as meta_err:
             log.error(f"[CONVEYOR] Failed to write ready meta sidecar: {meta_err}")
@@ -4664,6 +5074,51 @@ async def history_log_scheduler():
         await asyncio.sleep(max(wait_seconds, 60))
 
 
+# === [BOOTSTRAP] Функция загрузки данных с диска при старте ===
+def bootstrap_from_disk() -> dict:
+    """[BOOTSTRAP] Загружает очереди с диска: ready_to_publish + buffer.
+    
+    Returns:
+        dict с ключами: loaded_ready, loaded_buffer, total
+    """
+    global POST_QUEUE
+    result = {"loaded_ready": 0, "loaded_buffer": 0, "total": 0}
+    
+    # === ШАГ 1: Очистка in-memory очередей ===
+    POST_QUEUE.clear()
+    log.info("[BOOTSTRAP] queues cleared")
+    
+    # === ШАГ 2: Сканирование ready_to_publish ===
+    try:
+        ready_files = list(READY_TO_PUBLISH_DIR.glob("*.mp4"))
+        json_files = list(READY_TO_PUBLISH_DIR.glob("*.json"))
+        log.info(f"[BOOTSTRAP] ready_to_publish: mp4={len(ready_files)} json={len(json_files)}")
+        result["loaded_ready"] = len(ready_files)
+    except Exception as e:
+        log.error(f"[BOOTSTRAP] ready scan error: {e}")
+    
+    # === ШАГ 3: Сканирование buffer (POST_QUEUE file) ===
+    try:
+        if QUEUE_FILE.exists():
+            data = json.loads(QUEUE_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                for item in data:
+                    POST_QUEUE.append(item)
+                result["loaded_buffer"] = len(data)
+                log.info(f"[BUFFER_SCAN] found={len(data)}")
+            else:
+                log.warning("[BUFFER_SCAN] queue file has invalid format")
+        else:
+            log.info("[BUFFER_SCAN] found=0 (no queue file)")
+    except Exception as e:
+        log.error(f"[BOOTSTRAP] buffer load error: {e}")
+    
+    result["total"] = result["loaded_ready"] + result["loaded_buffer"]
+    log.info(f"[BOOTSTRAP] loaded_ready={result['loaded_ready']} loaded_buffer={result['loaded_buffer']} total={result['total']}")
+    
+    return result
+
+
 def load_ready_files_to_queue():
     """
     Загружает готовые видео из ready_to_publish в POST_QUEUE.
@@ -4726,14 +5181,50 @@ def load_ready_files_to_queue():
             meta_data = json.loads(meta_file.read_text(encoding="utf-8"))
 
             # Создаем item для очереди
+            file_id = meta_data.get("file_id", "unknown")
             item = {
                 "type": "video",
-                "file_id": meta_data.get("file_id", "unknown"),
+                "file_id": file_id,
                 "caption": meta_data.get("caption", ""),
                 "ready_file_path": str(ready_file),
                 "ready_metadata": meta_data,
                 "from_ready_folder": True  # Флаг, что это готовый файл
             }
+            
+            # === HAQIQAT_HARD_BIND v1.1: Восстанавливаем hard-bind поля из JSON ===
+            post_id_restored = meta_data.get("post_id") or meta_data.get("haqiqat_post_id")  # fallback для совместимости
+            file_id_restored = meta_data.get("file_id") or meta_data.get("haqiqat_file_id")  # fallback для совместимости
+            overlay_text_clean = meta_data.get("overlay_text_clean")
+            caption_text_clean = meta_data.get("caption_text_clean")
+            
+            # Проверяем наличие критических полей
+            if not (post_id_restored and overlay_text_clean and caption_text_clean):
+                log.warning(f"[HARD_BIND_WARNING] Missing critical fields in {ready_file.name}:")
+                log.warning(f"  post_id: {post_id_restored or 'MISSING'}")
+                log.warning(f"  overlay_text_clean: {bool(overlay_text_clean)} (len={len(overlay_text_clean) if overlay_text_clean else 0})")
+                log.warning(f"  caption_text_clean: {bool(caption_text_clean)} (len={len(caption_text_clean) if caption_text_clean else 0})")
+            
+            # Восстанавливаем стандартные поля в item (унифицированно)
+            if post_id_restored:
+                item["post_id"] = post_id_restored
+            if file_id_restored:
+                item["file_id"] = file_id_restored
+            if overlay_text_clean:
+                item["overlay_text_clean"] = overlay_text_clean
+            if caption_text_clean:
+                item["caption_text_clean"] = caption_text_clean
+            
+            log.info(f"[HARD_BIND] Restored: post_id={post_id_restored} file_id={file_id_restored or 'N/A'} overlay_len={len(overlay_text_clean) if overlay_text_clean else 0}")
+
+            # === ДЕДУПЛИКАЦИЯ при загрузке готовых файлов ===
+            if file_id != "unknown":
+                for idx, existing_item in enumerate(POST_QUEUE):
+                    if existing_item.get("file_id") == file_id:
+                        log.info(f"[DEDUP_READY] Found duplicate file_id={file_id} at queue[{idx}]")
+                        log.info(f"[DEDUP_READY] Removing old: {existing_item.get('ready_file_path', 'unknown')}")
+                        POST_QUEUE.pop(idx)
+                        log.info(f"[DEDUP_READY] Removed old, will add new: {ready_file.name}")
+                        break
 
             POST_QUEUE.append(item)
             loaded_count += 1
@@ -4788,11 +5279,24 @@ async def maintain_ready_posts_worker(application):
                     ensure_post_id(video_item, video_item.get("id"))
                     video_item_failures = int(video_item.get("failures") or 0)
                     video_item["failures"] = video_item_failures
+                    
+                    # === [STOP_PIPELINE_CRASH] Лог начала обработки ===
+                    video_file_id_short = (video_item.get("file_id") or "?")[:20]
+                    log.info(f"[PIPE] start post_id={video_item.get('id')} file_id={video_file_id_short}...")
                     log.info(
                         f"[PIPE] DEQUEUE type={video_item.get('type')} id={video_item.get('id')} failures={video_item_failures}"
                     )
-                    # Подготавливаем видео
-                    ready_path = await prepare_video_for_ready(application, video_item)
+                    
+                    # === [STOP_PIPELINE_CRASH] Обёртка try/except для продолжения очереди ===
+                    try:
+                        # Подготавливаем видео
+                        ready_path = await prepare_video_for_ready(application, video_item)
+                    except Exception as pipe_err:
+                        # Ошибка одного ролика НЕ останавливает очередь
+                        log.error(f"[PIPE] EXCEPTION during prepare: {type(pipe_err).__name__}: {pipe_err}")
+                        ready_path = None
+                        video_item["last_prepare_error"] = type(pipe_err).__name__
+                        video_item["last_prepare_error_detail"] = str(pipe_err)
                     
                     if ready_path:
                         log.info(f"[CONVEYOR] Successfully prepared: {ready_path.name}")
@@ -4806,10 +5310,15 @@ async def maintain_ready_posts_worker(application):
                         video_item["failures"] = failure_count
                         failure_reason = video_item.get("last_prepare_error") or "unknown"
                         failure_detail = video_item.get("last_prepare_error_detail") or ""
-                        log.critical(
-                            f"🚨 CRITICAL | [CONVEYOR] Failed to prepare video (reason={failure_reason}, failures={failure_count})"
-                        )
-                        if failure_count >= CONVEYOR_MAX_FAILURES:
+                        
+                        # === [STOP_PIPELINE_CRASH] FileTooBig skip - сразу в failed, без retry ===
+                        if failure_reason == "filetoobig_skip":
+                            video_item["error"] = failure_detail or failure_reason
+                            artifact = _record_failed_conveyor_item(video_item, failure_reason, failure_detail)
+                            artifact_name = artifact.name if artifact else "n/a"
+                            log.warning(f"[PIPE] SKIP_TO_FAILED (FileTooBig) id={video_item.get('id')} artifact={artifact_name}")
+                            # continue queue - не останавливаем
+                        elif failure_count >= CONVEYOR_MAX_FAILURES:
                             error_detail = failure_detail or failure_reason
                             video_item["error"] = error_detail
                             artifact = _record_failed_conveyor_item(video_item, failure_reason, error_detail)
@@ -4933,12 +5442,77 @@ def _finalize_uzbek_output(text: str, logger, context: str) -> str:
     return normalized
 
 
+# === [MAIN_TEXT_CLEAN] Паттерны бренд-мусора для очистки описания ===
+BRAND_TRASH_PATTERNS = [
+    # Русские бренды
+    r"МИР\s*БЕЗ\s*ИЛЛЮЗИЙ",
+    r"Мир\s*фактов",
+    r"Cerebra",
+    r"Церебра",
+    r"Факты\+?",
+    r"Факты\s*которые\s*не\s*загуглишь",
+    # Узбекские/латинские бренды
+    r"DUNYO\s*ILLYuZIYALARSIZ",
+    r"DUNYO\s*ILLYUZIYALARSIZ",
+    r"Dunyo\s*xronikasi",
+    r"Dunyo\s*qiziqarli",
+    r"Dunyo\s*faktlari",
+    r"Dunyo\s*hayolsiz",
+    r"Illyuziyasiz\s*dunyo",
+    # MAX/Endi фразы
+    r"Endi\s+biz\s+MAXdamiz",
+    r"biz\s+MAXdamiz",
+    r"MAXdamiz",
+    r"Endi\s+biz",
+    # Эмодзи-мусор в контексте брендов
+    r"🎭\s*",
+    r"🧠\s*Haqiqat",
+    # Призывы к подписке (не хвосты, а в тексте)
+    r"Kanalga\s+obuna\s+bo'ling",
+    r"Obuna\s+bo'ling",
+    r"Подписывайтесь",
+    r"Подпишитесь",
+]
+
+
+def clean_main_text(text: str) -> tuple[str, list[str]]:
+    """[MAIN_TEXT_CLEAN] Удаляет бренд-мусор из основного текста описания.
+    
+    Returns:
+        (cleaned_text, list_of_removed_phrases)
+    """
+    if not text:
+        return "", []
+    
+    removed = []
+    cleaned = text
+    
+    for pattern in BRAND_TRASH_PATTERNS:
+        matches = re.findall(pattern, cleaned, flags=re.IGNORECASE)
+        if matches:
+            removed.extend(matches)
+            cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE)
+    
+    # Убираем лишние пробелы и пустые строки после удаления
+    cleaned = re.sub(r"[ \t]+", " ", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    cleaned = re.sub(r"^\s+", "", cleaned, flags=re.MULTILINE)
+    cleaned = cleaned.strip()
+    
+    return cleaned, removed
+
+
 def clean_text_before_translation(text: str) -> str:
     """Удаляет служебные хвосты (названия каналов, подписи) перед переводом"""
     if not text:
         return text
     
     import re
+    
+    # === [MAIN_TEXT_CLEAN] Сначала очищаем от бренд-мусора ===
+    cleaned, removed = clean_main_text(text)
+    if removed:
+        log.info(f"[TRANSLATE_PRE_CLEAN] removed brand trash: {removed}")
     
     # Паттерны для удаления служебных хвостов
     patterns_to_remove = [
@@ -4956,7 +5530,6 @@ def clean_text_before_translation(text: str) -> str:
         r"Подписка на[^\n]*",
     ]
     
-    cleaned = text
     for pattern in patterns_to_remove:
         cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE)
     
@@ -4987,20 +5560,44 @@ async def translate_text(text: str) -> str:
     cleaned_text = clean_text_before_translation(text)
 
     # RESTORE_UZ_JIVOY_TRANSLATION_PROMPT: Константа UZ-ЖИВОЙ стиля перевода
+    # === [PROMPT_HARDENING_V1.1] STRICT LOCK MODE ===
     UZ_JIVOY_PROMPT = (
-        "Ты — переводчик на узбекский (латиница).\n"
-        "Стиль: UZ-ЖИВОЙ.\n"
-        "Правила:\n"
-        "- по смыслу точно\n"
-        "- разговорная современная речь, как люди говорят\n"
-        "- короткие живые фразы, естественный порядок слов\n"
-        "- без книжных оборотов и канцелярита\n"
-        "- можно лёгкие усилители: baribir, bas qiling, ikki og'iz и т.п.\n"
-        "- ритм через тире/переносы, допускаются '...' для эмоции\n"
-        "- цель: звучать живо и понятно\n"
-        "Формат: вернуть только перевод, без пояснений.\n"
-        "Yozuv talabi: faqat LOTIN alifbosi. Hech qachon кириллица ishlatma, apostrof sifatida faqat oddiy ' qo'lla (o', g'). Return Uzbek ONLY in Latin script. Do NOT use smart quotes ' ' yoki `.`"
+        "Ты переводишь текст с русского на узбекский (латиница).\n"
+        "Режим: ТОЧНЫЙ ФАКТИЧЕСКИЙ ПЕРЕВОД (без фантазий).\n"
+        "\n"
+        "ЖЁСТКИЕ ПРАВИЛА:\n"
+        "- НЕЛЬЗЯ добавлять новые факты, объекты, числа или причины.\n"
+        "- НЕЛЬЗЯ убирать важные детали или сокращать смысл.\n"
+        "- НЕЛЬЗЯ менять субъект и объект предложения (кто что сделал и над чем).\n"
+        "- НЕЛЬЗЯ менять причинно-следственные связи.\n"
+        "- НЕЛЬЗЯ заменять точные термины более общими словами.\n"
+        "- Если формулировка уже точная — НЕ перефразируй её ради красоты.\n"
+        "- Если предложение короткое — оставь его коротким.\n"
+        "\n"
+        "СТИЛЬ UZ-ЖИВОЙ:\n"
+        "- Живая разговорная речь.\n"
+        "- Естественный порядок слов.\n"
+        "- Без канцелярита и книжности.\n"
+        "- Без интро-крючков и рекламы.\n"
+        "\n"
+        "ФОРМАТ ОТВЕТА:\n"
+        "- Верни только перевод.\n"
+        "- Без комментариев и пояснений.\n"
+        "- Только латиница.\n"
+        "- Апостроф использовать только обычный: ' (o', g').\n"
+        "- Не использовать умные кавычки или символ `.\n"
     )
+    
+    # РЕЖИМ МАКСИМАЛЬНО-СТРОГИЙ (опционально, для максимального приближения к оригиналу):
+    # UZ_JIVOY_FACTS_STRICT = (
+    #     "Ты — машинный переводчик на узбекский (латиница). РЕЖИМ: ТОЧНЫЙ ПЕРЕВОД.\n"
+    #     "Правила (ОБЯЗАТЕЛЬНО выполнять в этом порядке):\n"
+    #     "1. Переводи СЛОВО В СЛОВО, сохраняя исходный смысл\n"
+    #     "2. Не добавляй НИКАКИХ слов, которых нет в оригинале\n"
+    #     "3. Не усиливай эмоции и не менай экспрессию оригинала\n"
+    #     "4. Живой узбекский язык, но БЕЗ новых интриг\n"
+    #     "Выведи только перевод."
+    # )
     
     from hashlib import sha1
 
@@ -5012,8 +5609,9 @@ async def translate_text(text: str) -> str:
             # Первый проход: перевод
             TRANSLATION_LAST_COST = 0.0
             resp1 = openai_client.chat.completions.create(
-                model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+                model=os.getenv("OPENAI_MODEL", "gpt-4o"),
                 max_tokens=800,
+                temperature=0.1,
                 messages=[
                     {
                         "role": "system",
@@ -5045,8 +5643,9 @@ async def translate_text(text: str) -> str:
 
             # Второй проход: self-check
             resp2 = openai_client.chat.completions.create(
-                model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+                model=os.getenv("OPENAI_MODEL", "gpt-4o"),
                 max_tokens=800,
+                temperature=0.0,
                 messages=[
                     {
                         "role": "system",
@@ -6933,13 +7532,23 @@ async def post_worker(application, item, upload_path, caption, caption_tg, capti
         log.warning("[SYNC_PUBLISH_INCOMPLETE] Not all platforms succeeded - keeping file in ready folder")
     
     # cleanup после отправки: переносим готовые файлы в архив и чистим временные
+    # [ARCHIVE_GUARANTEED] Архивируем при ЛЮБОМ успехе публикации (tg OR ig OR fb)
     try:
-        if all_platforms_ok and upload_path and not upload_path_is_url:
+        if publish_success and upload_path and not upload_path_is_url:
             upload_path_as_path = Path(str(upload_path)) if isinstance(upload_path, str) else upload_path
             if upload_path_as_path and upload_path_as_path.parent == READY_TO_PUBLISH_DIR:
-                _archive_ready_artifacts(upload_path_as_path)
-        elif not all_platforms_ok and upload_path:
-            log.info(f"[SYNC_PUBLISH] Keeping {Path(str(upload_path)).name} in ready folder (publish incomplete)")
+                # Определяем json для лога
+                resolved_json = _resolve_ready_json(upload_path_as_path)
+                resolved_json_name = resolved_json.name if resolved_json and resolved_json.exists() else "none"
+                try:
+                    _archive_ready_artifacts(upload_path_as_path)
+                    log.info(f"[ARCHIVE_CALL] mp4={upload_path_as_path.name} json={resolved_json_name} result=ok")
+                except Exception as arch_err:
+                    log.error(f"[ARCHIVE_CALL] mp4={upload_path_as_path.name} json={resolved_json_name} result=error err={arch_err}")
+            else:
+                log.info(f"[ARCHIVE_CALL] mp4={upload_path_as_path.name if upload_path_as_path else 'none'} json=skip result=skip (not in ready_dir)")
+        elif not publish_success and upload_path:
+            log.info(f"[ARCHIVE_CALL] mp4={Path(str(upload_path)).name} json=skip result=skip (publish_success=False)")
     except Exception as e:
         log.warning(f"[CONVEYOR] ready archive error: {e}")
 
@@ -6980,8 +7589,17 @@ async def post_worker(application, item, upload_path, caption, caption_tg, capti
     await delete_from_buffer(application, item)
     await send_progress_report(application)
     LAST_VIDEO_TIME = datetime.now()
-    LAST_POST_TIME = datetime.now()
-    save_last_post_time()
+    
+    # [PUBLISH_SUCCESS_GUARD] Обновляем LAST_POST_TIME только при реальном успехе
+    if publish_success:
+        LAST_POST_TIME = datetime.now()
+        save_last_post_time()
+        _mark_slot_used()  # [SLOT_SCHEDULE] Помечаем слот как использованный
+        publish_mode = "postnow" if FORCE_POST_NOW else "scheduled"
+        log.info(f"[PUBLISH_SUCCESS] ts={LAST_POST_TIME.strftime('%Y-%m-%d %H:%M:%S')} mode={publish_mode}")
+    else:
+        log.warning("[PUBLISH_INCOMPLETE] LAST_POST_TIME not updated (publish_success=False)")
+    
     # Increment schedule counters (9 posts/day: 3 morning + 6 evening)
     now_publish = datetime.now()
     if now_publish.hour < 14:
@@ -7331,7 +7949,7 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     log.info("RAW before translate: %s", text_for_translate[:200] if text_for_translate else "(empty)")
 
-    # ГАРАНТИРУЕМ перевод ВСЕХ постов
+    # ГАРАНТИРУЕМ перевод ВСЕХ постов - РЕЖИМ ФАКТЫ БЕЗ КРЮЧКА
     if text_for_translate.strip():
         # преобразуем entities в маркеры перед переводом
         try:
@@ -7340,14 +7958,15 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
             log.warning(f"[TEXT] entities_to_markers failed: {e}")
             prepared = text_for_translate
         
-        # Используем новый УЗ-ЖИВОЙ генератор вместо translate_text
-        translated = await generate_uz_jivoy_hook(prepared)
+        # ФИКСАЦИЯ_РЕЖИМА_LIVE: Используем translate_text (факты БЕЗ крючков)
+        # Не используем generate_uz_jivoy_hook() так как он добавляет интригующие фразы
+        # translate_text() автоматически использует UZ_JIVOY_PROMPT (разговорный, естественный)
+        log.info(f"[TRANSLATE_CALL] prepared_len={len(prepared) if prepared else 0}")
+        translated = await translate_text(prepared)
         
         # Логирование для отладки
-        src_clean = strip_forbidden_tails(prepared)
-        cat = await detect_category_openai(src_clean)
-        log.info(f"[UZJIVOY_CAT] {cat}")
-        log.info(f"[UZJIVOY_IN] {repr(src_clean[:200])}")
+        log.info(f"[UZJIVOY_STYLE] mode=FACTS_NO_HOOK (no hooks/intrigue)")
+        log.info(f"[UZJIVOY_IN] {repr(prepared[:200])}")
         log.info(f"[UZJIVOY_OUT] {repr(translated[:200])}")
     else:
         translated = ""
@@ -7489,6 +8108,13 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         # Для TG видео используем tg_video_local_path, для Instagram используем instagram_video_path
         actual_local_path = tg_video_local_path if post.video and tg_video_local_path else (str(instagram_video_path) if instagram_video_path else None)
         
+        # === BINDING_KEY: Жёсткая связка video ↔ post_data ===
+        # Генерируем уникальный ключ, чтобы 100% был match между видео и текстом
+        file_unique_id = post.video.file_unique_id if post.video else (
+            f"instagram_{os.path.basename(str(instagram_video_path))}" if instagram_video_path else "unknown"
+        )
+        binding_key = f"{chat_id}:{message_id}:{file_unique_id}:{os.path.basename(actual_local_path) if actual_local_path else 'no_video'}"
+        
         item = {
             "type": "video",
             "file_id": post.video.file_id if post.video else "instagram_source",
@@ -7507,6 +8133,7 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
             "voiceover_path": str(voiceover_path) if voiceover_path else None,  # 🎙️ Путь к озвучке
             "instagram_source": instagram_url if instagram_url else None,
             "tg_too_big": tg_too_big_flag,  # ✅ NEW: Flag if TG file exceeded size limit
+            "binding_key": binding_key,  # === НОВОЕ: Жёсткая связка ===
         }
     else:
         # если только текст, включаем режим карусели
@@ -7558,7 +8185,28 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
     # ✅ Дополнительная диагностика для видео с local_path
     if item.get("type") == "video" and item.get("local_path"):
         log.info(f"[DEBUG] Video item with local_path: {Path(item['local_path']).name if Path(item['local_path']).exists() else 'FILE_NOT_FOUND'}")
+    
+    # === ДЕДУПЛИКАЦИЯ: Убиваем дубликаты по file_id перед очередью ===
+    current_file_id = item.get("file_id")
+    if current_file_id and current_file_id != "instagram_source":
+        # Ищем в очереди если уже есть item с ТАКИМ же file_id
+        for idx, existing_item in enumerate(POST_QUEUE):
+            if existing_item.get("file_id") == current_file_id:
+                log.info(f"[DEDUP_QUEUE] Found duplicate file_id={current_file_id} at queue[{idx}]")
+                log.info(f"[DEDUP_QUEUE] Removing old item: id={existing_item.get('id')} caption={repr(existing_item.get('caption', '')[:50])}")
+                POST_QUEUE.pop(idx)
+                log.info(f"[DEDUP_QUEUE] Removed. New item will be added instead.")
+                break
+    
     log.info(f"[PIPE] ENQUEUE type={item.get('type')} id={item.get('id')} file_id={item.get('file_id')}")
+    
+    # === ЛОГИРОВАНИЕ СВЯЗКИ: video ↔ post_data ===
+    if item.get("type") == "video":
+        local_filename = os.path.basename(item.get("local_path", "")) if item.get("local_path") else "no_video"
+        queue_post_id = item.get("post_id") or item.get("id") or "unknown"
+        queue_file_id = item.get("file_id", "unknown")[:20]
+        log.info(f"[QUEUE_BIND] post_id={queue_post_id} file_id={queue_file_id} path={local_filename}")
+    
     POST_QUEUE.append(item)
     save_queue()
     log.info("Post queued. Queue size=%s", len(POST_QUEUE))
@@ -7625,7 +8273,14 @@ def main() -> None:
     load_stats()
     load_published_texts()
     load_last_post_time()
+    
+    # === [BOOTSTRAP] Загрузка данных с диска при старте ===
+    log.info("[SAFE_MODE] restart detected -> strike disabled")
+    bootstrap_result = bootstrap_from_disk()
+    log.info(f"[SAFE_MODE] auto publish disabled for {RESTART_SAFE_MODE_TIMEOUT}s after start")
+    
     log.info(f"INFO | [CONFIG] Current publish interval: {PUBLISH_INTERVAL_SECONDS // 60} minutes")
+    log.info(f"INFO | [CONFIG] Strict 60 min guard: {PUBLISH_STRICT_INTERVAL_SEC}s")
     log.info("System ready. All social networks optimized.")
     log.info("Golden Template Active. Content Separated.")
     global STARTUP_AT
@@ -7671,6 +8326,17 @@ def main() -> None:
                 log.warning("[STARTUP] No ready files found on disk.")
         except Exception as e:
             log.error(f"[STARTUP] Error scanning ready files: {e}")
+        
+        # 📥 [STARTUP_BUFFER_LOAD] Загружаем видео из ready_to_publish ВСЕГДА (убран skip)
+        log.info("[STARTUP_BUFFER_LOAD] Loading ready files to queue (ALWAYS, no skip)...")
+        try:
+            loaded = load_ready_files_to_queue()
+            if loaded > 0:
+                log.info(f"[STARTUP_BUFFER_LOAD] SUCCESS: Loaded {loaded} files from ready_to_publish to queue")
+            else:
+                log.info("[STARTUP_BUFFER_LOAD] No files found in ready_to_publish")
+        except Exception as e:
+            log.error(f"[STARTUP_BUFFER_LOAD] Error loading from ready: {e}")
         
         # Разовая очистка Supabase от сиротских файлов перед стартом
         try:
@@ -7726,16 +8392,34 @@ def main() -> None:
             log.error(f"[TMP_CLEANUP] Error during tmp_media cleanup: {e}")
         
         # Запускаем workers
-        # HOTFIX: Guard for video_processing_worker
-        if "video_processing_worker" in globals() and callable(globals()["video_processing_worker"]):
-            asyncio.create_task(video_processing_worker())
+        # [ANTI_DOUBLE_POST] Защита от двойного запуска воркеров
+        global _WORKERS_STARTED
+        if '_WORKERS_STARTED' not in globals():
+            _WORKERS_STARTED = False
+        
+        if _WORKERS_STARTED:
+            log.warning("[WORKER_START] already_running - skipping duplicate worker start")
         else:
-            log.warning("[STARTUP] video_processing_worker not found — skipped")
-        asyncio.create_task(post_worker_loop(app))
-        asyncio.create_task(scheduled_ready_worker(app))
-        asyncio.create_task(daily_report_scheduler(app))
-        asyncio.create_task(history_log_scheduler())
-        asyncio.create_task(maintain_ready_posts_worker(app))  # CONVEYOR worker
+            _WORKERS_STARTED = True
+            log.info("[WORKER_START] starting all workers (first time)")
+            
+            # === [WORKER] Запуск всех воркеров ===
+            asyncio.create_task(post_worker_loop(app))
+            log.info("[WORKER] post_worker_loop started OK")
+            
+            asyncio.create_task(scheduled_ready_worker(app))
+            log.info("[WORKER] scheduled_ready_worker started OK")
+            
+            asyncio.create_task(daily_report_scheduler(app))
+            log.info("[WORKER] daily_report_scheduler started OK")
+            
+            asyncio.create_task(history_log_scheduler())
+            log.info("[WORKER] history_log_scheduler started OK")
+            
+            asyncio.create_task(maintain_ready_posts_worker(app))  # CONVEYOR worker
+            log.info("[WORKER] maintain_ready_posts_worker (CONVEYOR) started OK")
+            
+            log.info("[WORKER_START] all workers started successfully")
         
         log.info("[CONVEYOR] All workers started. Waiting for /postnow command or scheduled publish time.")
 
