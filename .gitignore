@@ -13,3 +13,63 @@ downloads/
 *.wav
 *.mp3
 
+# === CLEAN REPO v1.0 ===
+
+# runtime / generated
+*.log
+*.tmp
+*.ipynb
+
+# local data/state
+state/
+data/
+published/
+reports/
+tmp/
+_failed/
+ready_to_publish/
+raw_buffer/
+raw_buffer_archive/
+
+# local artifacts / docs (только untracked)
+*.md
+*.txt
+*.diff
+
+# lock files
+*.lock
+
+# assets (keep local)
+assets/
+refs/
+tests/
+
+# untracked py scripts
+acs_assistant.py
+demo_meta_run.py
+fix_indent2.py
+fix_ready_meta.py
+fix_toptext.py
+print_ready_meta_log.py
+run_bot.bat
+run_bot.py
+status_monitor.py
+telethon_downloader.py
+test_409_guard.py
+test_queue_consumer.py
+test_syntax.py
+tore --staged
+
+# untracked json
+CAPTION_FIX_SUMMARY.json
+POSTNOW_SYNC_NOFAIL_SUMMARY.json
+published_keys.json
+
+# untracked fonts
+fonts/Montserrat All/
+fonts/Poppins All/
+
+# BUT keep requirements & important configs (НЕ ИГНОРИМ)
+!README.md
+!requirements.txt
+!.gitignore
